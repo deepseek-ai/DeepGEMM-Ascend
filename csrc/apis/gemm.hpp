@@ -260,7 +260,9 @@ inline constexpr auto fp8_fp4_gemm_tt = fp8_fp4_gemm<true, false>;
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel
 //         will panic
 //     d: shape [M, N], bf16 or fp32.
-//     grouped_layout: [G], int32. Per-group row counts describing the contiguous partition of A.
+//     grouped_layout: [G], int32. Prefix sum over the groups of A: entry g is the end of group g,
+//         and group g+1 starts at aligned(entry_g, mk_alignment). Entries must therefore not
+//         decrease below the aligned end of the previous group.
 //     recipe: optional combined quantization granularity (gran_m, gran_n, gran_k);
 //         mutually exclusive with recipe_a / recipe_b.
 //     recipe_a: optional per-operand granularity (gran_mn, gran_k) for A.
@@ -328,7 +330,9 @@ inline constexpr auto m_grouped_fp8_fp4_gemm_nn_contiguous = m_grouped_fp8_fp4_g
 //         will panic
 //     d: shape [G, M, N], bf16 or fp32.
 //     ks_cpu: optional [G], int (on CPU). Per-group K sizes.
-//     grouped_layout: [G], int32. Per-group layout describing the contiguous K partition.
+//     grouped_layout: [G], int32. Prefix sum over the K partition: entry g is the end of group g,
+//         and group g+1 starts at aligned(entry_g, mk_alignment). Entries must therefore not
+//         decrease below the aligned end of the previous group.
 //     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
 //     recipe: combined quantization granularity (gran_m, gran_n, gran_k).
 //     compiled_dims: which dimensions are baked in as compile-time constants.
@@ -446,7 +450,9 @@ inline constexpr auto bf16_gemm_tt = bf16_gemm<true, false>;
 //     a: [M, K] (nt/nn), bf16
 //     b: [G, N, K] (nt) or [G, K, N] (nn), bf16
 //     d: [M, N], bf16 or fp32.
-//     grouped_layout: [G], int32. Per-group row counts describing the contiguous partition of A.
+//     grouped_layout: [G], int32. Prefix sum over the groups of A: entry g is the end of group g,
+//         and group g+1 starts at aligned(entry_g, mk_alignment). Entries must therefore not
+//         decrease below the aligned end of the previous group.
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.
 //     ensure_zero_padding: when true, the output is zero-padded only if the input
@@ -493,7 +499,9 @@ inline constexpr auto m_grouped_bf16_gemm_nn_contiguous = m_grouped_bf16_gemm_co
 //     b: [K, N] (tn), bf16
 //     d: [G, M, N], bf16 or fp32.
 //     ks_cpu: optional [G], int (on CPU). Per-group K sizes.
-//     grouped_layout: [G], int32. Per-group layout describing the contiguous K partition.
+//     grouped_layout: [G], int32. Prefix sum over the K partition: entry g is the end of group g,
+//         and group g+1 starts at aligned(entry_g, mk_alignment). Entries must therefore not
+//         decrease below the aligned end of the previous group.
 //     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.

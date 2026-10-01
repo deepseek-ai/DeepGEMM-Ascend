@@ -152,7 +152,8 @@ struct Scheduler {
                 last_psum_m = aligned(current_psum_m, kAlignment);
                 current_psum_m = static_cast<uint32_t>(grouped_layout[current_group_idx]);
                 current_m_block_cumsum += num_m_blocks;
-                num_m_blocks = ceil_div(current_psum_m - last_psum_m, BLOCK_M);
+                num_m_blocks = current_psum_m > last_psum_m ?
+                    ceil_div(current_psum_m - last_psum_m, BLOCK_M) : 0;
             }
             // Map the in-group block index through the same swizzle, then shift the m-block
             // to its global position (last_psum_m is BLOCK_M-aligned so the divide is exact).
@@ -173,7 +174,7 @@ struct Scheduler {
                 current_sf_k_cumsum = last_psum_k / MX_SF_DIVISOR;
                 if (current_shape_k > 0) // if shape_k == 0, there are no blocks to consume, so don't increment the cumsum
                     current_k_block_cumsum += num_blocks;
-                current_shape_k = current_psum_k - last_psum_k;
+                current_shape_k = current_psum_k > last_psum_k ? current_psum_k - last_psum_k : 0;
             }
             uint32_t in_group_idx = block_idx - current_k_block_cumsum;
             get_swizzled_block(in_group_idx, num_m_blocks, m_block_idx, n_block_idx);
