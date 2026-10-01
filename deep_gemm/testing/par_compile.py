@@ -14,9 +14,12 @@ def dry_run():
 
 
 def par_compile(callables: list[Callable[[], None]], *, max_workers: int = None, progress=True):
+    device = torch.npu.current_device()
+
     def run(fn):
-        torch.npu.current_stream()
-        return fn()
+        with torch.npu.device(device):
+            torch.npu.current_stream()
+            return fn()
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     torch.npu.current_stream()
