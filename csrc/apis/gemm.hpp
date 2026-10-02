@@ -102,6 +102,12 @@ static std::optional<GemmDesc> get_gemm_desc(
         DJ_HOST_ASSERT(grouped_layout->is_contiguous());
         DJ_HOST_ASSERT(grouped_layout->scalar_type() == torch::kInt);
     }
+    // The epilogue accumulates in place into D, so C must be the same tensor: only the presence
+    // of `c` reaches the kernel, never a pointer into it.
+    if (c.has_value()) {
+        DJ_HOST_ASSERT(c->data_ptr() == d.data_ptr(),
+                       "c must be the same tensor as d; the kernel accumulates into d in place");
+    }
 
     if (gemm_early_return(m, n, k, d, c, epilogue_class->get_output_sf())) {
         return std::nullopt;
