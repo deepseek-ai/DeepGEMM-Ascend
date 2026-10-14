@@ -65,6 +65,7 @@ def gemm_dg(test: GemmTestDesc, a: torch.Tensor, b: torch.Tensor, c: torch.Tenso
         b = b if trans_ab[1] == 't' else get_transposed(b, 0, 1)
         getattr(deep_gemm, f'{gemm_name}_gemm_{trans_ab}')(a, b, d, **extra_args)
     elif test.gemm_type == GemmType.MGroupedContiguousWithPsumLayout:
+        extra_args['ensure_zero_padding'] = test.ensure_zero_padding
         if test.has_sf:
             extra_args['recipe_a'] = test.a_recipe
             extra_args['recipe_b'] = test.b_recipe

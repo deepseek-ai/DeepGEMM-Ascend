@@ -128,8 +128,9 @@ struct Scheduler {
     // which is truncated to the group's valid-row tail (psum[group] - m_block_start).
     __aicore__ uint32_t get_actual_m(uint32_t m_block_idx) const {
         if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
-            // TODO: remove this and add tail handling for ensure_zero_padding=True
-            return BLOCK_M;
+            // m_block_idx is global (last_psum_m is BLOCK_M-aligned) and current_psum_m is the
+            // group's valid end row, so the difference is exactly this block's valid-row tail.
+            return min(current_psum_m - m_block_idx * BLOCK_M, BLOCK_M);
         } else {
             return min(shape_m - m_block_idx * BLOCK_M, BLOCK_M);
         }
