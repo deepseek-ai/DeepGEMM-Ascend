@@ -361,41 +361,42 @@ def bench_msprof(
 
     # Use ASCEND_WORK_PATH to control where the profiler dumps temp files.
     old_work_path = os.environ.get('ASCEND_WORK_PATH')
-    with tempfile.TemporaryDirectory(prefix='dg_bench_npu_') as prof_dir:
-        os.environ['ASCEND_WORK_PATH'] = prof_dir
+    try:
+        with tempfile.TemporaryDirectory(prefix='dg_bench_npu_') as prof_dir:
+            os.environ['ASCEND_WORK_PATH'] = prof_dir
 
-        if backend == 'fast':
-            def on_trace_ready(_prof):
-                pass
-        else:
-            on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(str(prof_dir))
-
-        with suppress_stdout_stderr(suppress_verbose_output):
-            with torch_npu.profiler.profile(
-                activities=[ torch_npu.profiler.ProfilerActivity.NPU ],
-                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
-                on_trace_ready=on_trace_ready,
-                experimental_config=torch_npu.profiler._ExperimentalConfig(
-                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                    aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                    l2_cache=False,
-                    data_simplification=False,
-                ),
-            ) as prof:
-                profile_fn()
-                torch.npu.synchronize()
-                prof.step()
-
-            prof_path = Path(prof.prof_if.prof_path)
             if backend == 'fast':
-                profiles = _parse_ffts_profile(prof_path)
+                def on_trace_ready(_prof):
+                    pass
             else:
-                profiles = _parse_kernel_details_csv(prof_path)
+                on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(str(prof_dir))
 
-    if old_work_path is None:
-        os.environ.pop('ASCEND_WORK_PATH', None)
-    else:
-        os.environ['ASCEND_WORK_PATH'] = old_work_path
+            with suppress_stdout_stderr(suppress_verbose_output):
+                with torch_npu.profiler.profile(
+                    activities=[ torch_npu.profiler.ProfilerActivity.NPU ],
+                    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+                    on_trace_ready=on_trace_ready,
+                    experimental_config=torch_npu.profiler._ExperimentalConfig(
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                        l2_cache=False,
+                        data_simplification=False,
+                    ),
+                ) as prof:
+                    profile_fn()
+                    torch.npu.synchronize()
+                    prof.step()
+
+                prof_path = Path(prof.prof_if.prof_path)
+                if backend == 'fast':
+                    profiles = _parse_ffts_profile(prof_path)
+                else:
+                    profiles = _parse_kernel_details_csv(prof_path)
+    finally:
+        if old_work_path is None:
+            os.environ.pop('ASCEND_WORK_PATH', None)
+        else:
+            os.environ['ASCEND_WORK_PATH'] = old_work_path
 
     return _select_profiles(profiles, kernel_names, return_all_kernels)
 
