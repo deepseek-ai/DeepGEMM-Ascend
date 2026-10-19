@@ -146,6 +146,31 @@ Grouped GEMM for DeepSeek MoE experts (FP8×FP4, BF16 output). `#Groups` is the 
 | 8 | 4096 | 4096 | 4096 | 1356.5 | 861 | 180 |
 | 8 | 4096 | 4096 | 2048 | 681.0 | 858 | 179 |
 
+### Small-M grouped GEMM
+
+For decode workloads with few tokens per expert, opt into `deep_gemm.set_mk_alignment_for_contiguous_layout(16)` **before constructing the padded inputs and cumulative group layout**. Values 16, 64, 128 and 256 are supported; the default remains 256. The setting is process-wide, so keep it consistent with the tensors being used and restore 256 before reusing layouts constructed for the default. K-grouped MX requires alignment at least 64. Weights retain their existing ND format.
+
+Measured on Ascend 950DT_9582, Python 3.12.13, PyTorch 2.10.0 / torch_npu 2.10.0.post6, CANN 9.1 with the official 9.2 prerelease CAPI overlay. These are matched local measurements, not comparisons against README numbers collected on another software stack.
+
+Each pair uses the same physical card, seed, logical operands, group counts, ND weight layout and BF16 output. The baseline kernel is unmodified `3a35326` with alignment 256; the candidate explicitly opts into alignment 16 and repacks the activation/group layout accordingly. We use the corrected read-only L2 sweep from [issue #11](https://github.com/deepseek-ai/DeepGEMM-Ascend/issues/11) for **both** revisions: sum a preinitialized int32 buffer twice the reported L2 size (256 MiB on this host) before each call. Time only `gemm_impl`; exclude initialization, SF conversion, L2 sweep and host overhead. Each result is the median of three 30-sample window means following ten cold warmups per window. Raw exported profiler traces and all window means were retained. Eight devices run independent cases; each baseline/candidate pair runs sequentially on its assigned device.
+
+The three primary columns follow `tests/common.py` / `tests/utils.py`: `Latency = kernel time`, `Computation = 2*M_padded_total*N*K/time`, `Memory bandwidth = count_bytes(A, B, D)/time`. Byte counts include native packed FP4/FP8 data, the actual packed UE8M0 scale tensors passed to the API, padding and BF16 output, and exclude layout metadata as the existing test does. Both revisions use identical scale representation. GB/s is this tensor-byte estimate, not a hardware traffic counter. Since padding is intentionally reduced, nominal TFLOPS and sometimes GB/s decrease even when useful-token latency improves. The supplementary effective TFLOPS uses the same valid `M_total` on both sides. All arrows are baseline → candidate.
+
+| Type | Groups | Valid M/group | Padded M/group | N | K | Latency (us) | Computation (TFLOPS) | Memory bandwidth (GB/s) | Speedup |
+| --- | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: |
+| FP4×FP4 | 32 | 4 | 256 → 16 | 3072 | 5120 | 159.155 → 92.520 | 1619.17 → 174.08 | 2136.3 → 2939.1 | 1.720× |
+| FP4×FP4 | 32 | 4 | 256 → 16 | 5120 | 1536 | 93.126 → 53.786 | 1383.59 → 149.72 | 2408.2 → 2590.9 | 1.731× |
+| FP8×FP8 | 32 | 4 | 256 → 16 | 3072 | 5120 | 307.729 → 168.994 | 837.42 → 95.31 | 1990.8 → 3106.0 | 1.821× |
+| FP8×FP8 | 32 | 4 | 256 → 16 | 5120 | 1536 | 160.765 → 100.070 | 801.47 → 80.47 | 2216.8 → 2653.9 | 1.607× |
+| FP8×FP4 | 32 | 4 | 256 → 16 | 3072 | 5120 | 304.256 → 224.367 | 846.98 → 71.78 | 1186.4 → 1217.8 | 1.356× |
+| FP8×FP4 | 32 | 4 | 256 → 16 | 5120 | 1536 | 155.131 → 118.272 | 830.58 → 68.09 | 1486.2 → 1181.6 | 1.312× |
+| FP4×FP4 | 32 | 1 | 256 → 16 | 3072 | 5120 | 159.107 → 92.396 | 1619.65 → 174.32 | 2136.9 → 2943.0 | 1.722× |
+| FP8×FP4 | 8 | 3 | 256 → 16 | 4096 | 2048 | 45.903 → 34.223 | 748.52 → 62.75 | 1236.4 → 1080.3 | 1.341× |
+
+The six M=4 cases are reference shapes; the final two rows are additional small-shape checks. Default-alignment large-shape checks showed −0.020% to +0.028% latency change. Ordinary GEMM tuning is not included.
+
+Reproduce with `python tests/benchmark_small_m_grouped_gemm.py --dtype fp4 --groups 32 --m 4 --n 3072 --k 5120 --alignment 16 --output /tmp/small-m-candidate`. For the baseline, run the same script against `3a35326` with `--alignment 256`, applying only the read-sum benchmark fix to that checkout. Other paths use `--dtype fp8` or `--dtype mixed`. The script uses the repository profiler with the same read-sum sweep, 10 warmups and 30 measured calls per window, and reports both padded and effective TFLOPS. Run correctness checks with `python tests/test_small_m_grouped_gemm.py --alignment 16`, repeating for 64, 128 and 256.
+
 ### MQA Logits
 
 MQA scoring for the DeepSeek Lightning Indexer. The kernel is FIX-pipe bound rather than compute bound, saturating the FIX pipe at 99% utilization.

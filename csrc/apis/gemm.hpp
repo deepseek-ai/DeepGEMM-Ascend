@@ -90,6 +90,8 @@ static std::optional<GemmDesc> get_gemm_desc(
             DJ_HOST_ASSERT(major_a == Major::K);
             break;
         case GemmType::KGroupedContiguousWithPsumLayout:
+            DJ_HOST_ASSERT(!sfa_in.has_value() || Runtime::get_mk_alignment_for_contiguous_layout() % MX_SF_DIVISOR == 0,
+                           "K-grouped MX requires an alignment of at least one 64-element SF pair");
             std::tie(g, m, n, k) = get_shape_by_spec<"gmnk">("mk"_sp = a, "nk"_sp = b, "gmn"_sp = d, "g"_sp = grouped_layout.value());
             DJ_HOST_ASSERT(major_a == Major::MN);
             DJ_HOST_ASSERT(major_b == Major::MN);

@@ -265,7 +265,7 @@ def _make_l2_flush_buffer():
 
     properties = torch.npu.get_device_properties(torch.npu.current_device())
     num_bytes = 2 * properties.L2_cache_size
-    return torch.empty(num_bytes // 4, dtype=torch.int, device='npu')
+    return torch.ones(num_bytes // 4, dtype=torch.int, device='npu')
 
 
 def _select_profiles(profiles, kernel_names, return_all_kernels):
@@ -332,6 +332,7 @@ def bench_msprof(
     torch.npu.synchronize()
 
     flush_buffer = _make_l2_flush_buffer() if flush_l2 else None
+    flush_result = torch.empty((), dtype=torch.int32, device='npu') if flush_l2 else None
     profile_barrier = barrier if barrier_comm_profiling else None
     if barrier_comm_profiling and profile_barrier is None:
         import torch.distributed as dist
@@ -342,7 +343,7 @@ def bench_msprof(
     def profile_fn():
         for _ in range(num_tests):
             if flush_buffer is not None:
-                flush_buffer.zero_()
+                torch.sum(flush_buffer, dim=(0,), dtype=torch.int32, out=flush_result)
             if profile_barrier is not None:
                 # 20ms, keep the device busy so the barrier dominates instead
                 # of kernel launch gaps.

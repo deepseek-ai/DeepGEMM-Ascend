@@ -612,7 +612,8 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
         m_range = {block_m, block_m};
         int block_n = std::min<int>(L0CSizeBytes / (sizeof(float) * block_m), align(d.n, n_alignment));
         if (dtype.dequant_b && is_mn_major(d.major_b)) block_n = block_cap;
-        n_range = {block_n, block_n};
+        // Small M alignments need narrower N candidates to fit the L1 pipeline.
+        n_range = {std::min(block_n, block_cap), block_n};
     }
 
     // Determine block k

@@ -57,19 +57,19 @@ public:
     }
 
     static constexpr int kMkAlignment = 256;
+    inline static int mk_alignment_value = kMkAlignment;
 
     static int get_mk_alignment_for_contiguous_layout() {
-        return kMkAlignment;
+        return mk_alignment_value;
     }
 
     static void set_mk_alignment_for_contiguous_layout(const int& mk_alignment) {
-        if (mk_alignment != kMkAlignment)
-            DJ_PANIC("mk_alignment is fixed at {} currently, but attempted to set it to {}", kMkAlignment, mk_alignment);
-        DJ_HOST_ASSERT(mk_alignment % 64 == 0);
+        DJ_HOST_ASSERT(mk_alignment == 16 || mk_alignment == 64 || mk_alignment == 128 || mk_alignment == 256);
+        mk_alignment_value = mk_alignment;
     }
 
     static int get_theoretical_mk_alignment_for_contiguous_layout() {
-        return kMkAlignment;
+        return 16;
     }
 };
 
