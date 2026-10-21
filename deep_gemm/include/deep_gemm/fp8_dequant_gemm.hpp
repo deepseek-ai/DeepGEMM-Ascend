@@ -359,6 +359,10 @@ __global__ __mix__(1, 2) void fp8_dequant_gemm_impl(
             last_sfb = sfb.addr;
         }
     } else {
+        if constexpr (is_m_grouped && kDirectStore && BLOCK_M < kAlignment) {
+            if (asc_get_sub_block_id() == 1)
+                epilogue.template aiv_zero_group_padding<kNumCores, kAlignment>(gm_d, shape_n, grouped_layout, num_groups);
+        }
         if (kDualAIVDequant || asc_get_sub_block_id() == kDequantAIVId) {
             const uint32_t dequant_aiv_idx = kDualAIVDequant ? asc_get_sub_block_id() : kDequantAIVId;
             vf_build_lut(ub_lut.ptr());
@@ -424,6 +428,8 @@ __global__ __mix__(1, 2) void fp8_dequant_gemm_impl(
             if constexpr (kDirectStore) return;
             if constexpr (is_k_grouped && !kWithAccumulation)
                 epilogue.template aiv_zero_empty_groups<kNumCores, kAlignment>(gm_d, shape_m, shape_n, grouped_layout, num_groups);
+            if constexpr (is_m_grouped && BLOCK_M < kAlignment)
+                epilogue.template aiv_zero_group_padding<kNumCores, kAlignment>(gm_d, shape_n, grouped_layout, num_groups);
             epilogue.aiv_initialize();
 
             uint32_t s_epi = 0;

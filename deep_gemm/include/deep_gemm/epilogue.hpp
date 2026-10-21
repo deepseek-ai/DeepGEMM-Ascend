@@ -96,13 +96,51 @@ struct Epilogue {
         }
     }
 
+    template <uint32_t kRows = MAD_M>
     static __simd_vf__ inline void zero_values(__ubuf__ uint32_t* output) {
         constexpr uint32_t kNumValuesPerVector = asc_get_vf_len() / sizeof(uint32_t);
-        static_assert(MAD_M * MAD_N * sizeof(cd_dtype_t) % asc_get_vf_len() == 0);
+        static_assert(kRows * MAD_N * sizeof(cd_dtype_t) % asc_get_vf_len() == 0);
         vector_uint32_t zero;
         asc_duplicate_scalar(zero, uint32_t(0));
-        for (uint32_t value_idx = 0; value_idx < MAD_M * MAD_N * sizeof(cd_dtype_t) / sizeof(uint32_t); value_idx += kNumValuesPerVector)
+        for (uint32_t value_idx = 0; value_idx < kRows * MAD_N * sizeof(cd_dtype_t) / sizeof(uint32_t); value_idx += kNumValuesPerVector)
             asc_storealign(output + value_idx, zero, asc_create_mask_b32(PAT_ALL));
+    }
+
+    template <uint32_t kNumCores, uint32_t kAlignment>
+    __aicore__ void aiv_zero_group_padding(gm_ptr<cd_dtype_t> d, uint32_t shape_n,
+                                           __gm__ int32_t* grouped_layout, uint32_t num_groups) const {
+        constexpr uint32_t kMaxRows = UBSizeBytes / (MAD_N * sizeof(cd_dtype_t)) / MAD_M * MAD_M;
+        constexpr uint32_t kZeroRows = kAlignment < kMaxRows ? kAlignment : kMaxRows;
+        constexpr uint32_t kNumWorkers = kNumCores * kNumAIVs;
+        const uint32_t worker = block_idx * kNumAIVs + asc_get_sub_block_id() - (2 - kNumAIVs);
+        const uint32_t num_n_tiles = ceil_div(shape_n, MAD_N);
+        const ub_ptr<cd_dtype_t> output_ub(kZeroRows, MAD_N, ub.addr);
+        bool initialized = false;
+        uint32_t tile_base = 0;
+        for (uint32_t group = 0; group < num_groups; ++group) {
+            const uint32_t end = static_cast<uint32_t>(grouped_layout[group]);
+            const uint32_t begin = aligned(end, BLOCK_M), padded_end = aligned(end, kAlignment);
+            const uint32_t num_tiles = ceil_div(padded_end - begin, kZeroRows) * num_n_tiles;
+            for (uint32_t tile = (worker + kNumWorkers - tile_base % kNumWorkers) % kNumWorkers;
+                 tile < num_tiles; tile += kNumWorkers) {
+                if (!initialized) {
+                    zero_values<kZeroRows>(output_ub.template ptr<uint32_t>());
+                    asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    initialized = true;
+                }
+                const uint32_t m_idx = begin + tile / num_n_tiles * kZeroRows;
+                const uint32_t n_idx = tile % num_n_tiles * MAD_N;
+                copy_ub_to_gm(d.index(m_idx, n_idx).ptr(), output_ub,
+                              min(padded_end - m_idx, kZeroRows), min(shape_n - n_idx, MAD_N),
+                              d.stride_outer * sizeof(cd_dtype_t), kL2CacheMode);
+            }
+            tile_base += num_tiles;
+        }
+        if (initialized) {
+            asc_sync_notify(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            asc_sync_wait(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        }
     }
 
     template <uint32_t kNumCores, uint32_t kAlignment>

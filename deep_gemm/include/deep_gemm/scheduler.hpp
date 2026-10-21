@@ -16,7 +16,7 @@ namespace deep_gemm {
 //
 //   GemmType::MGroupedContiguousWithPsumLayout — MoE m-grouped, "contiguous" layout. A
 //     [M, K] / D [M, N] are one flat buffer with each group's rows concatenated; group g's
-//     valid rows occupy [align(psum[g-1], BLOCK_M), psum[g]) in the global M space (group 0
+//     valid rows occupy [align(psum[g-1], kAlignment), psum[g]) in the global M space (group 0
 //     starts at 0), where psum = grouped_layout is the prefix-sum-of-actual-rows array of
 //     length num_groups. B/SFB are per-group ([G, ...]); the group index is exposed via
 //     get_group_idx() for their GM offset. The padding tail of each group's last m-block is
@@ -65,7 +65,7 @@ struct Scheduler {
     uint32_t current_group_idx = 0;       // group the current block belongs to
 
     // m-grouped only
-    uint32_t last_psum_m = 0;             // align(psum[group-1], BLOCK_M) = current group start row
+    uint32_t last_psum_m = 0;             // align(psum[group-1], kAlignment) = current group start row
     uint32_t current_psum_m = 0;          // psum[group] = current group's valid end row
     uint32_t current_m_block_cumsum = 0;  // # m-blocks consumed by all previous groups
 
@@ -142,8 +142,7 @@ struct Scheduler {
         uint32_t block_idx = static_cast<uint32_t>(++current_iter) * kNumCores + core_id;
 
         if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
-            // TODO: remove this and add tail handling for ensure_zero_padding=True
-            static_assert(kAlignment == BLOCK_M);
+            static_assert(kAlignment % BLOCK_M == 0);
             while (true) {
                 if (block_idx < (current_m_block_cumsum + num_m_blocks) * num_n_blocks)
                     break;

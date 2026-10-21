@@ -101,9 +101,8 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
     const uint64_t block_bytes = static_cast<uint64_t>(block_m) * block_n * sizeof(float);
     if (block_bytes > L0CSizeBytes) return std::nullopt;
 
-    // Check MGroupedLayout: must use the fixed BLOCK_M for contiguous layout
-    // TODO: pad zero manually in output buffer for MGroupedLayout
-    if (is_m_grouped(d.gemm_type) && block_m != Runtime::get_mk_alignment_for_contiguous_layout()) return std::nullopt;
+    // Group starts must remain aligned when using smaller compute tiles.
+    if (is_m_grouped(d.gemm_type) && Runtime::get_mk_alignment_for_contiguous_layout() % block_m != 0) return std::nullopt;
 
     const int k_alignment = dtype.has_sf ? hw.sf_elements_per_pair : hw.get_mad_alignment_k(dtype.elem_bits);
     if (block_k % k_alignment) return std::nullopt;
@@ -589,11 +588,22 @@ static int64_t get_gemm_k_cost(const GemmDesc& d, const GemmDtype& dtype, const 
     return get_gemm_refinement_cost(d, dtype, c) + issue_ns + turnover_ns;
 }
 
-static GemmConfig select_gemm_config(const GemmDesc& d) {
+static GemmConfig select_gemm_config(const GemmDesc& input_desc) {
     // TODO: add a memorization cache for the selected config
 
+    auto d = input_desc;
     const auto hw = get_hw_desc();
     const auto dtype = get_gemm_dtype(d);
+    int grouped_block_m = Runtime::get_mk_alignment_for_contiguous_layout();
+    if (is_m_grouped(d.gemm_type) && dtype.has_sf && d.expected_m > 0 &&
+        dynamic_cast<const IdentityEpilogue*>(d.epilogue_class.get()) &&
+        (d.cd_dtype == at::kBFloat16 || d.cd_dtype == at::kFloat)) {
+        while (grouped_block_m > FRAC_MN && d.expected_m <= grouped_block_m / 2)
+            grouped_block_m /= 2;
+        // Model the scheduled rows, excluding padding skipped by the grouped scheduler.
+        if (grouped_block_m < Runtime::get_mk_alignment_for_contiguous_layout())
+            d.m = d.num_groups * align(d.expected_m, grouped_block_m);
+    }
     const int k = is_k_grouped(d.gemm_type) ? d.num_groups * d.expected_k : d.k;
     const int64_t compute_k = is_k_grouped(d.gemm_type) ? d.expected_k : d.k;
     const int num_batches = is_batched(d.gemm_type) || is_k_grouped(d.gemm_type) ? d.num_groups : 1;
@@ -608,11 +618,12 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
     const int m_limit = align(d.m, m_alignment);
     std::pair<int, int> m_range{m_alignment, std::min(block_cap, m_limit)}, n_range{n_alignment, block_cap};
     if (is_m_grouped(d.gemm_type)) {
-        const int block_m = Runtime::get_mk_alignment_for_contiguous_layout();
+        const int block_m = grouped_block_m;
         m_range = {block_m, block_m};
         int block_n = std::min<int>(L0CSizeBytes / (sizeof(float) * block_m), align(d.n, n_alignment));
         if (dtype.dequant_b && is_mn_major(d.major_b)) block_n = block_cap;
-        n_range = {block_n, block_n};
+        // Small M alignments need narrower N candidates to fit the L1 pipeline.
+        n_range = {std::min(block_n, block_cap), block_n};
     }
 
     // Determine block k
@@ -744,6 +755,32 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
         auto cached = config;
         cached.l2_ctrl_b = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM;
         if (get_gemm_k_cost(d, dtype, cached) <= get_gemm_k_cost(d, dtype, config)) config = cached;
+    }
+
+    // A small group consumes each K-major weight tile once; do not allocate it in L2.
+    if (is_m_grouped(d.gemm_type) && config.block_m < Runtime::get_mk_alignment_for_contiguous_layout() &&
+        d.expected_m > 0 && d.expected_m <= config.block_m && is_k_major(d.major_b)) {
+        config.l2_ctrl_b = asc_load_l2_cache_mode::NOTALLOC_KEEP;
+        // Direct output frees both AIVs to decode FP4 weights. AIV1 still clears group padding.
+        const auto stride_d = d.outer_stride_d ? d.outer_stride_d : d.n;
+        if (dtype.dequant_b && config.block_m == FRAC_MN && config.block_m == config.mad_m &&
+            is_k_major(d.major_a) && !d.acc && get_compiled_dim(d.n, 'n', d.compiled_dims) && d.n % FRAC_MN == 0 &&
+            reinterpret_cast<uintptr_t>(d.d_ptr) % hw.ub_bank_bytes == 0 &&
+            stride_d * c10::elementSize(d.cd_dtype) % hw.ub_bank_bytes == 0) {
+            config.direct_store = true;
+            config.dual_aiv_dequant = true;
+            // Narrow streaming tiles increase the number of UB decode buffers per AIV.
+            if (config.block_n == 512 && config.block_k == 256 && d.k > config.num_l1_stages * config.block_k) {
+                auto narrow = make_gemm_candidate(d, dtype, config.block_m, 256, config.block_k);
+                if (narrow && narrow->num_l1_stages >= config.num_l1_stages) {
+                    narrow->l2_ctrl_b = config.l2_ctrl_b;
+                    narrow->l2_ctrl_store_cd = config.l2_ctrl_store_cd;
+                    narrow->direct_store = true;
+                    narrow->dual_aiv_dequant = true;
+                    config = *narrow;
+                }
+            }
+        }
     }
 
     if (deep_jit::get_env<int>("DG_JIT_DEBUG") || deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
