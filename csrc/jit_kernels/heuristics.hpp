@@ -601,7 +601,14 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
     // Logical operand bytes without sector amplification or SF.
     const int64_t a_matrix_bytes = int64_t(d.m) * compute_k * dtype.elem_bits / 8;
     const int64_t b_matrix_bytes = int64_t(d.n) * compute_k * b_elem_bits / 8;
-    const int block_cap = dtype.elem_bits == 4 || dtype.dequant_b ? 256 : 512;
+    // Wider N tiles reduce decode waves when short-K native FP4 fills every core.
+    const bool wide_decode_fp4 = d.gemm_type == GemmType::Normal && dtype.elem_bits == 4 &&
+        d.m <= 128 && d.k <= 1024 && d.k % 512 == 0 && d.n % (512 * d.num_cores) == 0 &&
+        (d.k == 1024 || d.m >= 32) &&
+        is_k_major(d.major_a) && is_k_major(d.major_b) && !d.acc &&
+        dynamic_cast<const IdentityEpilogue*>(d.epilogue_class.get()) &&
+        (d.cd_dtype == at::kBFloat16 || d.cd_dtype == at::kFloat);
+    const int block_cap = wide_decode_fp4 ? 512 : dtype.elem_bits == 4 || dtype.dequant_b ? 256 : 512;
     const int m_alignment = is_mn_major(d.major_a) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
     const bool with_fp8_cast = d.cd_dtype == at::kFloat8_e4m3fn;
     const int n_alignment = with_fp8_cast ? hw.vector_reg_bytes / sizeof(uint16_t) : is_mn_major(d.major_b) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
