@@ -5,6 +5,7 @@
 
 #include <deep_gemm/ascend.hpp>
 #include <c_api/asc_simd.h>
+#include <utils/debug/asc_assert.h>  // ascendc_assert: exists in CANN 9.2 but is not pulled in via kernel_operator.h
 
 using namespace __cce_simd;
 
