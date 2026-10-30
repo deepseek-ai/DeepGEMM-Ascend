@@ -60,6 +60,7 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
                                             LinearTaskState& state, uint32_t core_idx,
                                             BlockPhase& block_phase, bool metadata_ready = true) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
     constexpr uint32_t kNumLinear1NBlocks = config.intermediate_hidden / (layout::BLOCK_N / 2);
     constexpr uint32_t kNumLinear2NBlocks = config.hidden / layout::BLOCK_N;
     constexpr uint32_t kNumSharedLinear1NBlocks = config.shared_intermediate_hidden / (layout::BLOCK_N / 2);

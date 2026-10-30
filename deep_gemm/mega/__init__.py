@@ -13,6 +13,9 @@ class SymmBuffer:
     Registered allocations stay in the pool until process exit; destroy() does not free HBM.
     Allocation order and buffer/handle owner lifetimes must match across ranks.
     Use base to share one allocation across sequential configurations.
+    num_sms selects 28, 32 or 36 AI cores, defaulting to get_num_sms().
+    All ranks must use the same core count. It is fixed for this buffer's lifetime;
+    later set_num_sms() calls affect only newly created buffers.
     Data views borrow memory: keep a SymmBuffer owner alive until all accesses complete.
     Views become invalid when the last owner releases the allocation, even if retained.
     """
@@ -24,7 +27,8 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: 'SymmBuffer | None' = None):
+                 base: 'SymmBuffer | None' = None,
+                 *, num_sms: int | None = None):
         assert mma_type == 'fp8xfp4', 'Ascend MegaMoE currently supports only fp8xfp4'
         assert activation == 'swiglu', 'Ascend MegaMoE currently supports only swiglu'
         self.group = group
@@ -36,10 +40,13 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self._num_sms = _C.get_num_sms() if num_sms is None else num_sms
+        if self._num_sms not in (28, 32, 36):
+            raise ValueError('Ascend MegaMoE supports 28, 32 or 36 AI cores')
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts, num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden, mma_type, activation, num_shared_experts)
+            hidden, intermediate_hidden, mma_type, activation, num_shared_experts, self.num_sms)
         if base is None:
             rank_idx = group.rank()
             self.handle = _C.SymmBuffer(rank_idx, group.size(),
@@ -71,6 +78,10 @@ class SymmBuffer:
         self.l1_acts = self.l1_acts_sf = None
         self.l2_acts = self.l2_acts_sf = None
         self._expert_recv_count = None
+
+    @property
+    def num_sms(self) -> int:
+        return self._num_sms
 
     @property
     def expert_recv_count(self) -> torch.Tensor:
@@ -180,5 +191,5 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.hidden, sym_buffer.intermediate_hidden, sym_buffer.num_shared_experts,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math, sym_buffer.num_sms
     )

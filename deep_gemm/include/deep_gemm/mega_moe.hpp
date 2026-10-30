@@ -108,6 +108,7 @@ constexpr auto kWriteThroughShare = static_cast<asc_store_l2_cache_mode>(12);
 
 template <const auto& workspace>
 struct CombineReduceState {
+    static constexpr uint32_t kNumAIVs = workspace.config.num_aivs;
     static constexpr uint32_t kNumBitsPerWord = sizeof(uint32_t) * 8;
     static constexpr uint32_t kUninitializedStage = ~0u;
 
@@ -141,6 +142,8 @@ __aicore__ inline bool advance_combine_reduce(__gm__ uint8_t* buffer, __gm__ bfl
                                       uint32_t num_tokens, CombineReduceState<workspace>& state,
                                       const ub_ptr<bfloat16_t>& ub_reduce_inputs, uint32_t num_steps = ~0u) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
+    constexpr uint32_t kNumAIVs = config.num_aivs;
     constexpr uint32_t kNumLinear2NBlocks = config.hidden / BLOCK_N;
     constexpr uint32_t kNumExpertsPerRank = config.num_experts / config.num_ranks;
     constexpr bool kHasSharedExperts = config.num_shared_experts > 0;
@@ -253,6 +256,7 @@ __aicore__ __forceinline__ void combine_reduce(__gm__ uint8_t* buffer, __gm__ bf
                                               uint32_t num_tokens, uint32_t rank_idx, uint32_t aiv_idx,
                                               CombineReduceState<workspace>& reduce, const layout::SymBuffer<>& sym_buffer) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAIVs = config.num_aivs;
 
     // Drain communication before reusing UB
     if constexpr (kOverlapReduce) {
@@ -403,6 +407,7 @@ template <const auto& workspace>
 __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_tokens, uint32_t rank_idx,
                                          const layout::Weights& weights, uint32_t core_idx) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
     constexpr uint32_t kNumRingBlocks = workspace.get_num_ring_blocks();
     constexpr bool kHasSharedExperts = config.num_shared_experts > 0;
     constexpr uint32_t kNumSFPairsPerChunk = 32;
@@ -675,6 +680,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                                           CombineReduceState<workspace>& reduce,
                                           float activation_clamp, uint32_t core_idx, const layout::SymBuffer<>& sym_buffer) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
     constexpr uint32_t kNumLinear1NBlocks = config.intermediate_hidden / (BLOCK_N / 2);
     constexpr uint32_t kNumLinear2NBlocks = config.hidden / BLOCK_N;
     constexpr uint32_t kNumSharedLinear1NBlocks = config.shared_intermediate_hidden / (BLOCK_N / 2);
@@ -1123,7 +1129,8 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 }
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kNumAICores>
 __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ int32_t* cumulative_local_expert_recv_stats,
                                             __gm__ const uint8_t* l1_weights, __gm__ const int16_t* l1_weights_sf,
                                             __gm__ const uint8_t* l2_weights, __gm__ const int16_t* l2_weights_sf,
@@ -1132,8 +1139,10 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
                                             uint32_t num_tokens, float activation_clamp,
                                             layout::SymBuffer<> sym_buffer) {
     constexpr auto& workspace = layout::kWorkspace<kNumRanks, kNumExperts, kNumSharedExperts,
-                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden>;
+                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden, kNumAICores>;
+    static_assert(kNumAICores == 28 or kNumAICores == 32 or kNumAICores == 36);
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAIVs = config.num_aivs;
 
     // Measured 32 MiB combine-work threshold for tail reduction
     constexpr bool kOverlapReduce = static_cast<uint64_t>(config.num_max_tokens_per_rank) *

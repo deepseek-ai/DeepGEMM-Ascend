@@ -78,6 +78,44 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.get_paged_mqa_logits_metadata`: build the scheduling metadata for the paged MQA kernels
 - `deep_gemm.aclnn_fp8_fp4_gemm_{nt, nn, tn, tt}` and `deep_gemm.aclnn_bf16_gemm_{nt, nn, tn, tt}`: ACLNN reference GEMMs used to cross-check the kernels in tests
 
+### MegaMoE core configuration
+
+MegaMoE supports 28, 32 and 36 AI cores on Ascend 950DT. By default,
+`SymmBuffer` uses `get_num_sms()` (the detected device count unless overridden).
+To select a count for MegaMoE without changing other kernels, pass `num_sms`:
+
+```python
+buffer = deep_gemm.SymmBuffer(
+    group, num_experts=384, num_max_tokens_per_rank=4096, num_topk=6,
+    hidden=5120, intermediate_hidden=2304, num_shared_experts=1,
+    num_sms=28,  # 28, 32 or 36; cannot exceed the device's available AI cores
+)
+```
+
+Alternatively, call `deep_gemm.set_num_sms(28)` before creating buffers. Each
+buffer retains its core count; changing the global setting does not change an
+existing buffer's layout or launches. All EP ranks must select the same count.
+Create a new buffer to change it. No package rebuild is needed: the workspace,
+scheduler and launch grid use the same count, which is part of the JIT kernel
+specialization and cache key. Other kernels retain their existing core-count limits.
+
+Host-only regressions (no NPU allocation):
+
+```bash
+c++ -std=c++20 -Ideep_gemm/include tests/test_mega_moe_layout.cpp -o /tmp/test_mega_moe_layout
+/tmp/test_mega_moe_layout
+python -m unittest discover -s tests -p test_mega_moe_core_config.py -v
+```
+
+Run the numerical regression on a device with enough AI cores and the required
+EP communication setup; replace `28` with `32` or `36` on the corresponding device:
+
+```bash
+python tests/test_mega_moe.py --num-processes 8 --num-sms 28 \
+    --hidden 5120 --intermediate-hidden 2304 --num-experts 384 --num-topk 6 \
+    --num-tokens 0 1 6 12 150 4096 --num-shared-experts 1 --skip-prof
+```
+
 ### Environment Variables
 
 Ascend home path is given by `ASCEND_HOME_PATH` or `ASCEND_TOOLKIT_HOME`.

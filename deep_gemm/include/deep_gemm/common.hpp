@@ -47,10 +47,6 @@ __aicore__ constexpr auto align(T1 a, T2 b) -> decltype(a + b) { return (a + b -
 template <typename T1, typename T2>
 __aicore__ constexpr auto aligned(T1 a, T2 b) -> decltype(a + b) { return (a + b - 1) / b * b; }
 
-// Ascend 950DT core topology
-inline constexpr uint32_t kNumAICores = 32;
-inline constexpr uint32_t kNumAIVs = 2 * kNumAICores;
-
 inline constexpr uint32_t L1SizeBytes = 512 * 1024;   // L1 per core
 inline constexpr uint32_t L0ASizeBytes = 64 * 1024;   // L0A
 inline constexpr uint32_t L0BSizeBytes = 64 * 1024;   // L0B
