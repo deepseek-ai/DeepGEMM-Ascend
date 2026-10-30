@@ -1,6 +1,7 @@
 #pragma once
 
 #include <c_api/asc_simd.h>
+#include <utils/debug/asc_assert.h>
 #include <deep_gemm/common.hpp>
 
 // Device primitives, split by abstraction layer:
