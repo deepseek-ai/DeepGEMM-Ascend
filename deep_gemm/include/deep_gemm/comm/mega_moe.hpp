@@ -120,6 +120,7 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
                              uint32_t num_tokens, uint32_t rank_idx, uint32_t worker_idx, uint32_t num_workers,
                              __ubuf__ const int64_t* offsets) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
     constexpr uint32_t kNumExpertsPerRank = config.num_experts / config.num_ranks;
 
     constexpr uint32_t kNumThreadsPerRound = kNumAICores * layout::kNumDispatchThreads;
@@ -243,6 +244,7 @@ template <const auto& workspace>
 __aicore__ __forceinline__ uint32_t wait_dispatch_metadata(__gm__ uint8_t* buffer, uint32_t rank_idx, uint32_t core_idx,
                                                            __gm__ int32_t* cumulative_local_expert_recv_stats) {
     constexpr auto& config = workspace.config;
+    constexpr uint32_t kNumAICores = config.num_ai_cores;
     const auto num_m_blocks_certificate = workspace.metadata.num_m_blocks_certificate.get_ptr(buffer);
 
     // Wait for source counts and sum local M-blocks

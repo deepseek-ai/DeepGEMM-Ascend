@@ -26,7 +26,13 @@ namespace py = pybind11;
 
 static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                                        uint32_t num_max_tokens_per_rank, uint32_t num_topk,
-                                       uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts) {
+                                       uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts,
+                                       int num_sms) {
+    const auto num_ai_cores = num_sms == 0 ? runtime->get_num_sms() : num_sms;
+    DJ_HOST_ASSERT(num_ai_cores == 28 or num_ai_cores == 32 or num_ai_cores == 36,
+                   "MegaMoE supports 28, 32 or 36 AI cores");
+    DJ_HOST_ASSERT(num_ai_cores <= jit->device.get_num_sms(),
+                   "MegaMoE core count exceeds the device's available AI cores");
     DJ_HOST_ASSERT(num_ranks > 0 and num_ranks < 256);
     DJ_HOST_ASSERT(num_experts > 0 and num_experts % num_ranks == 0);
     DJ_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -38,7 +44,7 @@ static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
     DJ_HOST_ASSERT(static_cast<uint64_t>(num_ranks) * num_max_tokens_per_rank * num_topk <
                    layout::kCountArrivalBit);
     return layout::Workspace{{num_ranks, num_experts, num_shared_experts, num_max_tokens_per_rank,
-                              num_topk, hidden, intermediate_hidden}};
+                              num_topk, hidden, intermediate_hidden, static_cast<uint32_t>(num_ai_cores)}};
 }
 
 // The root Tensor owns the HCCL lease; data views borrow its memory
@@ -72,10 +78,10 @@ static torch::Tensor slice_buffer(const torch::Tensor& buffer, uint64_t offset,
 static auto get_symm_buffer_size_for_mega_moe(
     uint32_t num_ranks, uint32_t num_experts, uint32_t num_max_tokens_per_rank, uint32_t num_topk,
     uint32_t hidden, uint32_t intermediate_hidden, const std::string& mma_type,
-    const std::string& activation, uint32_t num_shared_experts = 0) {
+    const std::string& activation, uint32_t num_shared_experts = 0, int num_sms = 0) {
     DJ_HOST_ASSERT(mma_type == "fp8xfp4" and activation == "swiglu");
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+                                         hidden, intermediate_hidden, num_shared_experts, num_sms);
     auto slice_input_buffers = [workspace](const torch::Tensor& buffer) {
         DJ_HOST_ASSERT(buffer.nbytes() >= workspace.get_num_bytes());
         const auto& config = workspace.config;
@@ -140,7 +146,8 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const int& num_sms
 ) {
     // Config checks
     const auto [rm, rn, rk] = recipe;
@@ -151,12 +158,11 @@ static void fp8_fp4_mega_moe(
     const auto num_ranks = static_cast<uint32_t>(sym_buffer_ptrs.size());
     // Use the registered layout dimensions, then validate tensors against them.
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+                                         hidden, intermediate_hidden, num_shared_experts, num_sms);
     DJ_HOST_ASSERT(y.dim() == 2 and y.size(0) <= num_max_tokens_per_rank and y.size(1) == hidden);
     DJ_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == (num_shared_experts > 0) and
                    shared_l2_weights_tuple_opt.has_value() == (num_shared_experts > 0));
     const auto num_tokens = static_cast<uint32_t>(y.size(0));
-    DJ_HOST_ASSERT(runtime->get_num_sms() == kNumAICores);
 
     // Registered allocations must remain valid until completion
     DJ_HOST_ASSERT(rank_idx >= 0 and rank_idx < num_ranks);
@@ -213,7 +219,7 @@ static void register_apis(py::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe,
           py::arg("num_ranks"), py::arg("num_experts"), py::arg("num_max_tokens_per_rank"), py::arg("num_topk"),
           py::arg("hidden"), py::arg("intermediate_hidden"), py::arg("mma_type"), py::arg("activation"),
-          py::arg("num_shared_experts") = 0);
+          py::arg("num_shared_experts") = 0, py::arg("num_sms") = 0);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe,
           py::arg("y"), py::arg("l1_weights_tuple"), py::arg("l2_weights_tuple"),
           py::arg("shared_l1_weights_tuple_opt"), py::arg("shared_l2_weights_tuple_opt"),
@@ -221,7 +227,7 @@ static void register_apis(py::module_& m) {
           py::arg("sym_buffer_ptrs"), py::arg("rank_idx"), py::arg("num_max_tokens_per_rank"),
           py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"),
           py::arg("intermediate_hidden"), py::arg("num_shared_experts"), py::arg("recipe"),
-          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"));
+          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"), py::arg("num_sms") = 0);
 }
 
 } // namespace deep_gemm::mega_moe

@@ -41,7 +41,9 @@ struct Config {
     uint32_t num_topk;
     uint32_t hidden;
     uint32_t intermediate_hidden;
+    uint32_t num_ai_cores;
 
+    const uint32_t num_aivs = 2 * num_ai_cores;
     const uint32_t shared_intermediate_hidden = num_shared_experts * intermediate_hidden;
     const uint32_t num_input_sf_pairs = hidden / MX_SF_DIVISOR;
 };
@@ -152,7 +154,7 @@ public:
         Buffer<uint64_t> src_token_metadata;
         Buffer<uint32_t> staged_token_topk_idx;
     } metadata{
-        .worker_expert_count = {next_offset, static_cast<uint64_t>(kNumAICores) * config.num_experts, kNumBufferAlignmentBytes},
+        .worker_expert_count = {next_offset, static_cast<uint64_t>(config.num_ai_cores) * config.num_experts, kNumBufferAlignmentBytes},
         .total_expert_count = {next_offset, config.num_experts},
         .combine_ready_prefix = {next_offset, config.num_ranks},
         .expert_recv_count = {next_offset, config.num_experts},
@@ -179,8 +181,8 @@ public:
         Buffer<uint8_t, kL2SectorBytes> metadata_ready;
     } progress{
         .blocks = {next_offset, static_cast<uint64_t>(kNumProgressStages) * num_progress_counters_per_stage},
-        .num_issued_gemms = {next_offset, kNumAICores},
-        .metadata_ready = {next_offset, kNumAICores},
+        .num_issued_gemms = {next_offset, config.num_ai_cores},
+        .metadata_ready = {next_offset, config.num_ai_cores},
     };
     const uint64_t num_progress_bytes = next_offset - progress.blocks.offset;
 
@@ -220,8 +222,8 @@ public:
 
     constexpr __aicore__ uint32_t get_num_ring_blocks() const {
         // Measured overlap window; the deadlock-safe minimum can still lose throughput
-        const uint32_t num_windows = config.hidden / BLOCK_N <= kNumAICores / 2 ? 4 : 1;
-        const uint32_t num_window_blocks = num_windows * kNumAICores;
+        const uint32_t num_windows = config.hidden / BLOCK_N <= config.num_ai_cores / 2 ? 4 : 1;
+        const uint32_t num_window_blocks = num_windows * config.num_ai_cores;
         return get_num_max_m_blocks() < num_window_blocks ? static_cast<uint32_t>(get_num_max_m_blocks()) : num_window_blocks;
     }
 
@@ -250,14 +252,16 @@ public:
 };
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kNumAICores>
 inline constexpr Workspace kWorkspace{{
-    kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden}};
+    kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden, kNumAICores}};
 
 template <const auto& workspace>
 constexpr __aicore__ uint32_t get_ring_block_idx(uint32_t pool_block_idx) {
     constexpr uint32_t kNumRingBlocks = workspace.get_num_ring_blocks();
-    return kNumRingBlocks == workspace.get_num_max_m_blocks() ? pool_block_idx : pool_block_idx & (kNumRingBlocks - 1);
+    // 28/36-core windows are not powers of two; masking aliases live blocks.
+    return kNumRingBlocks == workspace.get_num_max_m_blocks() ? pool_block_idx : pool_block_idx % kNumRingBlocks;
 }
 
 template <const auto& workspace>

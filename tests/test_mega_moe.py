@@ -245,6 +245,8 @@ def benchmark(case):
 
 def test(local_rank, args):
     _, num_ranks, group = init_dist(local_rank, args.num_processes)
+    if args.num_sms is not None:
+        deep_gemm.set_num_sms(args.num_sms)
 
     def buffer_size(config):
         (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = config
@@ -287,6 +289,8 @@ if __name__ == '__main__':
 
     # Resource settings
     parser.add_argument('--num-processes', type=int, default=8)
+    parser.add_argument('--num-sms', type=int, choices=[28, 32, 36], default=None,
+                        help='AI cores per device (default: detected hardware count)')
 
     # H/I pair by position; singleton lists broadcast, other model lists form a Cartesian product
     parser.add_argument('--hidden', type=int, nargs='+', default=[5120, 7168])
