@@ -76,8 +76,6 @@ static std::optional<GemmDesc> get_gemm_desc(
     const std::optional<uint32_t>& expected_k = std::nullopt
 ) {
     uint32_t g = 0, m = 0, n = 0, k = 0;
-    auto major_a = get_major_type_ab(a);
-    auto major_b = get_major_type_ab(b);
     switch (gemm_type) {
         case GemmType::Normal:
             std::tie(m, n, k) = get_shape_by_spec<"mnk">("mk"_sp = a, "nk"_sp = b, "mn"_sp = d);
@@ -87,12 +85,9 @@ static std::optional<GemmDesc> get_gemm_desc(
             break;
         case GemmType::MGroupedContiguousWithPsumLayout:
             std::tie(g, m, n, k) = get_shape_by_spec<"gmnk">("mk"_sp = a, "gnk"_sp = b, "mn"_sp = d, "g"_sp = grouped_layout.value());
-            DJ_HOST_ASSERT(major_a == Major::K);
             break;
         case GemmType::KGroupedContiguousWithPsumLayout:
             std::tie(g, m, n, k) = get_shape_by_spec<"gmnk">("mk"_sp = a, "nk"_sp = b, "gmn"_sp = d, "g"_sp = grouped_layout.value());
-            DJ_HOST_ASSERT(major_a == Major::MN);
-            DJ_HOST_ASSERT(major_b == Major::MN);
             break;
     }
 
@@ -115,8 +110,20 @@ static std::optional<GemmDesc> get_gemm_desc(
         DJ_HOST_ASSERT(dynamic_cast<const AlphaEpilogue*>(epilogue_class.get()) == nullptr,
                        "alpha and bias cannot be used together");
     }
-    if (gemm_early_return(m, n, k, d, c, epilogue_class->get_output_sf(), with_bias)) {
+    if (gemm_early_return(m, n, k, d, c, epilogue_class->get_output_sf(), with_bias) ||
+        (gemm_type == GemmType::Batched && g == 0)) {
         return std::nullopt;
+    }
+
+    // Empty contractions need no operand layout or kernel configuration. In
+    // particular, contiguous [M, 0] operands have ambiguous (1, 1) strides.
+    const auto major_a = get_major_type_ab(a);
+    const auto major_b = get_major_type_ab(b);
+    if (gemm_type == GemmType::MGroupedContiguousWithPsumLayout)
+        DJ_HOST_ASSERT(major_a == Major::K);
+    if (gemm_type == GemmType::KGroupedContiguousWithPsumLayout) {
+        DJ_HOST_ASSERT(major_a == Major::MN);
+        DJ_HOST_ASSERT(major_b == Major::MN);
     }
 
     if (with_bias)
