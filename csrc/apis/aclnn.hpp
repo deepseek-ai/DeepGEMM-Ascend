@@ -112,7 +112,7 @@ static torch::Tensor convert_sf_for_aclnn(const torch::Tensor& sf, int64_t mn, i
 //         * **sfB**: [ceil(N / gran_n), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel will panic
 //     d: shape [M, N], bf16 or fp32.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional input added to the product in D; C is preserved unless it aliases D.
 //     recipe: optional combined quantization granularity (gran_m, gran_n, gran_k);
 //         mutually exclusive with recipe_a / recipe_b.
 //     recipe_a: optional per-operand granularity (gran_mn, gran_k) for A.
@@ -204,7 +204,7 @@ inline constexpr auto aclnn_fp8_fp4_gemm_tt = aclnn_fp8_fp4_gemm<true, false>;
 //     a: [M, K] (nt/nn) or [K, M] (tn/tt), bf16
 //     b: [N, K] (nt/tt) or [K, N] (tn/nn), bf16
 //     d: [M, N], bf16.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional input added to the product in D; C is preserved unless it aliases D.
 template <bool kTransA, bool kTransB>
 static void aclnn_bf16_gemm(
     const torch::Tensor& a_,
@@ -214,13 +214,14 @@ static void aclnn_bf16_gemm(
 ) {
     auto a = get_transposed<kTransA>(a_, 0, 1);
     auto b = get_transposed<!kTransB>(b_, 0, 1);
-    auto cd = c.value_or(d);
     auto [m, n, k] = get_shape_by_spec<"mnk">("mk"_sp = a, "kn"_sp = b, "mn"_sp = d);
     if (gemm_early_return(m, n, k, d, c)) {
         return;
     }
 
-    AclTensor t_a(a), t_b(b), t_cd(cd);
+    // gemm_early_return has already copied/broadcast C into D when they differ.
+    // InplaceAddmm must accumulate into that destination, not overwrite its input C.
+    AclTensor t_a(a), t_b(b), t_cd(d);
     AclScalar<float> one(1.f);
 
     uint64_t ws_size = 0;
