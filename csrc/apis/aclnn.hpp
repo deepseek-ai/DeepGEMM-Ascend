@@ -54,10 +54,19 @@ static aclTensor* make_quant_operand(const torch::Tensor& t) {
 static torch::Tensor convert_sf_for_aclnn(const torch::Tensor& sf, int64_t mn, int64_t k, bool k_major) {
     DJ_HOST_ASSERT(sf.dim() == 2);
     DJ_HOST_ASSERT(sf.size(0) == mn);
-    DJ_HOST_ASSERT(sf.size(1) == ceil_div(k, static_cast<int64_t>(32)));
+    const int64_t sf_k_elems = ceil_div(k, static_cast<int64_t>(32));
+    const int64_t sf_k_pairs = ceil_div(sf_k_elems, static_cast<int64_t>(2));
+    const bool packed = sf.scalar_type() == at::kShort;
+    DJ_HOST_ASSERT(sf.size(1) == (packed ? sf_k_pairs : sf_k_elems));
 
     torch::Tensor sf_bytes;
-    if (sf.scalar_type() == at::kFloat) {
+    if (packed) {
+        // Each int16 stores two adjacent K scales. Native GEMM commonly uses
+        // MN-major scales, so materialize the logical rows before unpacking.
+        // Flatten also normalizes singleton K-pair strides before the dtype view.
+        sf_bytes = sf.contiguous().flatten().view(at::kByte)
+                       .reshape({mn, sf_k_pairs * 2}).slice(1, 0, sf_k_elems);
+    } else if (sf.scalar_type() == at::kFloat) {
         sf_bytes = sf.view(at::kInt).floor_divide(1 << 23).to(at::kByte);
     } else if (sf.scalar_type() == at::kFloat8_e8m0fnu or sf.scalar_type() == at::kByte) {
         sf_bytes = sf.view(at::kByte);
@@ -65,8 +74,6 @@ static torch::Tensor convert_sf_for_aclnn(const torch::Tensor& sf, int64_t mn, i
         DJ_PANIC("unsupported ACLNN scale factor dtype: {}", sf.scalar_type());
     }
 
-    const int64_t sf_k_elems = ceil_div(k, static_cast<int64_t>(32));
-    const int64_t sf_k_pairs = ceil_div(sf_k_elems, static_cast<int64_t>(2));
     if (sf_k_elems % 2 != 0) {
         // pad one zero byte on the right of K so the pair dim is full.
         sf_bytes = at::pad(sf_bytes, {0, 1}, "constant", 0);
@@ -105,11 +112,11 @@ static torch::Tensor convert_sf_for_aclnn(const torch::Tensor& sf, int64_t mn, i
 // Args:
 //     a: (A, sfA) tuple.
 //         * **A**: [M, K] (nt/nn) or [K, M] (tn/tt), fp8_e4m3 or fp4_e2m1x2
-//         * **sfA**: [ceil(M / gran_m), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
+//         * **sfA**: [ceil(M / gran_m), ceil(K / gran_k)] fp32, or [ceil(M / gran_m), ceil(K / (2 * gran_k))] short (packed ue8m0), in any major
 //         * **NOTE**: when sfA is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel will panic
 //     b: (B, sfB) tuple.
 //         * **B**: [N, K] (nt/tt) or [K, N] (tn/nn), fp8_e4m3 or fp4_e2m1x2
-//         * **sfB**: [ceil(N / gran_n), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
+//         * **sfB**: [ceil(N / gran_n), ceil(K / gran_k)] fp32, or [ceil(N / gran_n), ceil(K / (2 * gran_k))] short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel will panic
 //     d: shape [M, N], bf16 or fp32.
 //     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
