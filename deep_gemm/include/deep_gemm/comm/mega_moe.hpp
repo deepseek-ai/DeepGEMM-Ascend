@@ -1,4 +1,6 @@
 #pragma once
+#include <utils/debug/asc_printf.h>
+#include <utils/debug/asc_assert.h>
 
 #include <deep_gemm/ascend.hpp>
 #include <deep_gemm/layout/mega_moe.hpp>
@@ -55,7 +57,7 @@ __simt_callee__ __forceinline__ void grid_sync(__gm__ uint32_t* counter_ptr, uin
                 const uint32_t current = *reinterpret_cast<volatile __gm__ uint32_t*>(counter_ptr);
                 __asc_simt_vf::printf("MegaMoE grid sync timeout: rank=%u worker=%u grid=%u workers=%u current=0x%x expected_tag=0x%x\n",
                                      rank_idx, worker_idx, kGridSyncIdx, num_workers, current, expected_tag);
-                __trap();
+                __asc_simt_vf::__trap();
             }
         }
     }

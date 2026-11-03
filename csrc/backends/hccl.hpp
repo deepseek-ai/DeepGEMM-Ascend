@@ -118,8 +118,10 @@ private:
         uint32_t* layers = nullptr;
         uint32_t num_layers = 0;
         DG_HCCL_CHECK(HcclRankGraphGetLayers(comm, &layers, &num_layers));
-        DJ_HOST_ASSERT(num_layers > 1, "UBMEM requires network layer 1; got {} layers", num_layers);
-        const uint32_t layer = layers[1];
+        DJ_HOST_ASSERT(num_layers > 0, "UBMEM requires a network layer; got {} layers", num_layers);
+        // Single-server CANN 9.2 topologies expose UB_MEM on the only layer.
+        // make_peer_descriptor still verifies every peer has a UB_MEM link.
+        const uint32_t layer = layers[num_layers > 1 ? 1 : 0];
 
         std::vector<HcclChannelDesc> descriptors;
         descriptors.reserve(num_ranks - 1);
