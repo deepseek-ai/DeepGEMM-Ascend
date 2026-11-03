@@ -82,6 +82,13 @@ The library provides some utility functions besides the above kernels:
 
 Ascend home path is given by `ASCEND_HOME_PATH` or `ASCEND_TOOLKIT_HOME`.
 
+GEMM tile selection caches up to 256 configurations per calling thread. A new
+configuration clears a full cache before insertion. The cache stores host planning
+results and retains no tensors or device resources. `DG_JIT_DEBUG` and
+`DG_PRINT_CONFIGS` bypass this cache to preserve configuration diagnostics.
+`python tests/gemm_config_cache_scenario.py --device 0` checks repeated calls,
+core-count changes, bias selection and offset outputs against a CPU reference.
+
 Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` variable when unset, and is snapshotted when the JIT runtime is first created.
 
 - General

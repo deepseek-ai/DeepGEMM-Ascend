@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -589,9 +590,7 @@ static int64_t get_gemm_k_cost(const GemmDesc& d, const GemmDtype& dtype, const 
     return get_gemm_refinement_cost(d, dtype, c) + issue_ns + turnover_ns;
 }
 
-static GemmConfig select_gemm_config(const GemmDesc& d) {
-    // TODO: add a memorization cache for the selected config
-
+static GemmConfig compute_gemm_config(const GemmDesc& d) {
     const auto hw = get_hw_desc();
     const auto dtype = get_gemm_dtype(d);
     const int k = is_k_grouped(d.gemm_type) ? d.num_groups * d.expected_k : d.k;
@@ -751,6 +750,33 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
         const auto line = std::format("{} {}", d, config);
         if (printed.insert(line).second) std::puts(line.c_str());
     }
+    return config;
+}
+
+static GemmConfig select_gemm_config(const GemmDesc& d) {
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG") || deep_jit::get_env<int>("DG_PRINT_CONFIGS"))
+        return compute_gemm_config(d);
+
+    auto key = std::tuple{
+        d.m, d.n, d.k, d.num_cores, d.a_dtype, d.b_dtype, d.cd_dtype,
+        d.major_a, d.major_b, d.acc, d.gemm_type, d.num_groups, d.expected_m, d.expected_k,
+        d.stride_batch_a, d.stride_batch_b, d.outer_stride_a, d.outer_stride_b, d.outer_stride_d,
+        Runtime::get_mk_alignment_for_contiguous_layout(),
+        dynamic_cast<const IdentityEpilogue*>(d.epilogue_class.get()) != nullptr,
+        dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) != nullptr,
+        d.compiled_dims.find('n') != std::string::npos, d.compiled_dims.find('k') != std::string::npos,
+        reinterpret_cast<uintptr_t>(d.d_ptr) % get_hw_desc().ub_bank_bytes,
+    };
+    // Thread-local ownership avoids locking on the launch path.
+    static thread_local std::map<decltype(key), GemmConfig> configs;
+    if (const auto found = configs.find(key); found != configs.end())
+        return found->second;
+
+    const auto config = compute_gemm_config(d);
+    constexpr std::size_t kMaxCachedConfigs = 256;
+    if (configs.size() == kMaxCachedConfigs)
+        configs.clear();
+    configs.emplace(std::move(key), config);
     return config;
 }
 
