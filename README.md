@@ -21,7 +21,7 @@ DeepGEMM Ascend 代码轻量，并且在多种矩阵形状上能达到硬件极�
 ### Requirements
 
 - HUAWEI Ascend NPU (developed and validated on the Ascend 950 series)
-- CANN 9.20 toolkit providing `bin/bisheng`, `bin/ld.lld`
+- CANN 9.2.0 toolkit providing `bin/bisheng`, `bin/ld.lld`
 - Torch NPU package `torch_npu`
 - Python 3.10 or higher
 - Compilers and standard libraries with C++20 `<format>` support
