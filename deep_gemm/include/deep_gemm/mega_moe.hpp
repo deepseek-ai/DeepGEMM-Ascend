@@ -362,9 +362,33 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                 for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N) {
                     // Load packed FP4
                     wait<PIPE_V, PIPE_MTE2>(kFP4Empty, fp4_stage_idx);
-                    copy_gm_to_ub(ub_fp4[fp4_stage_idx],
-                                  const_cast<__gm__ uint8_t*>(weight_data + static_cast<uint64_t>(n_mad_idx) * (num_k / 2) + k_idx / 2),
-                                  MAD_N, valid_k / 2, num_k / 2, kNumPackedCols, weight_l2_hint);
+                    // Each 128-row group holds full K512 tiles followed by a compact K256 tail.
+                    constexpr uint32_t kPackedN = 128;
+                    constexpr uint32_t kPackedK = 512;
+                    static_assert((MAD_M == 128 && MAD_N == 128 && BLOCK_K == 512) ||
+                                  (MAD_M == 256 && MAD_N == 256 && BLOCK_K == 256));
+                    const uint32_t tile_k = k_idx / kPackedK * kPackedK;
+                    const uint32_t packed_stride = min(num_k - tile_k, kPackedK) / 2;
+                    const uint64_t tile_base = static_cast<uint64_t>(tile_k) * kPackedN / 2;
+                    auto* ub = ub_fp4[fp4_stage_idx].ptr();
+                    if constexpr (MAD_M == 128) {
+                        auto* gm = const_cast<__gm__ uint8_t*>(weight_data +
+                            static_cast<uint64_t>(n_mad_idx) * (num_k / 2) + tile_base);
+                        if (packed_stride == kNumPackedCols) {
+                            constexpr uint32_t bytes = MAD_N * kNumPackedCols;
+                            copy_gm_to_ub(ub, gm, 1, bytes, bytes, weight_l2_hint);
+                        } else {
+                            copy_gm_to_ub(ub_fp4[fp4_stage_idx], gm, MAD_N, packed_stride,
+                                          packed_stride, kNumPackedCols, weight_l2_hint);
+                        }
+                    } else {
+                        for (uint32_t n0 = 0; n0 < MAD_N; n0 += kPackedN) {
+                            auto* gm = const_cast<__gm__ uint8_t*>(weight_data +
+                                static_cast<uint64_t>(n0) * (num_k / 2) + tile_base + (k_idx - tile_k) / 2);
+                            copy_gm_to_ub(ub + n0 * kNumPackedCols, gm, kPackedN, valid_k / 2,
+                                          packed_stride, weight_l2_hint);
+                        }
+                    }
                     notify<PIPE_MTE2, PIPE_V>(kFP4Full, fp4_stage_idx);
 
                     // Dequantize to FP8 NZ
