@@ -13,8 +13,8 @@ class SymmBuffer:
     Registered allocations stay in the pool until process exit; destroy() does not free HBM.
     Allocation order and buffer/handle owner lifetimes must match across ranks.
     Use base to share one allocation across sequential configurations.
-    Data views borrow memory: keep a SymmBuffer owner alive until all accesses complete.
-    Views become invalid when the last owner releases the allocation, even if retained.
+    Data views retain the allocation; the last view or owner returns its lease
+    to the pool after outstanding device work completes.
     """
 
     def __init__(self, group: dist.ProcessGroup,
@@ -60,7 +60,7 @@ class SymmBuffer:
          self._expert_recv_count) = slice_input_buffers(self.buffer)
 
     def destroy(self) -> None:
-        """Drop this owner's references; views require another live owner of the allocation."""
+        """Drop this owner's references; retained views keep the allocation alive."""
         self.handle = None
         self.buffer = None
         self.group = None
