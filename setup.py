@@ -146,7 +146,7 @@ if __name__ == '__main__':
         name='deep_gemm',
         version=get_package_version(),
         packages=find_packages('.'),
-        install_requires=['tilelang'],
+        extras_require={'tilelang': ['tilelang']},
         package_data={
             'deep_gemm': [
                 'include/**/*',

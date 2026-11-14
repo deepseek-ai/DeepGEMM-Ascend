@@ -25,7 +25,7 @@ DeepGEMM Ascend 代码轻量，并且在多种矩阵形状上能达到硬件极�
 - Torch NPU package `torch_npu`
 - Python 3.10 or higher
 - Compilers and standard libraries with C++20 `<format>` support
-- `tilelang`, used by the HC prenorm kernel (declared as a package dependency)
+- `tilelang`, optional and used only by the HC prenorm kernel
 - `tree-sitter` and `tree-sitter-cpp`, used to generate Python type stubs when building from source
 
 ### Development
@@ -45,6 +45,10 @@ cat develop.sh
 ```bash
 pip install . --no-build-isolation
 ```
+
+To use the TileLang HC prenorm kernel, install its optional dependency with
+`pip install '.[tilelang]' --no-build-isolation`. MegaMoE and the native GEMM
+APIs do not import TileLang.
 
 ## Interfaces
 
