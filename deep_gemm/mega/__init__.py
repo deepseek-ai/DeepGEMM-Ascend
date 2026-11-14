@@ -13,8 +13,8 @@ class SymmBuffer:
     Registered allocations stay in the pool until process exit; destroy() does not free HBM.
     Allocation order and buffer/handle owner lifetimes must match across ranks.
     Use base to share one allocation across sequential configurations.
-    Data views borrow memory: keep a SymmBuffer owner alive until all accesses complete.
-    Views become invalid when the last owner releases the allocation, even if retained.
+    Data views retain the allocation; the last view or owner returns its lease
+    to the pool after outstanding device work completes.
     """
 
     def __init__(self, group: dist.ProcessGroup,
@@ -60,7 +60,7 @@ class SymmBuffer:
          self._expert_recv_count) = slice_input_buffers(self.buffer)
 
     def destroy(self) -> None:
-        """Drop this owner's references; views require another live owner of the allocation."""
+        """Drop this owner's references; retained views keep the allocation alive."""
         self.handle = None
         self.buffer = None
         self.group = None
@@ -113,6 +113,24 @@ def _reshape_weights(t: torch.Tensor) -> torch.Tensor:
     return _transform_fp8_nz(result) if t.dtype == torch.float8_e4m3fn else result
 
 
+def _pack_fp4_weights(weight: torch.Tensor) -> torch.Tensor:
+    """Store each 128-row FP4 tile contiguously, followed by its compact K tail."""
+    tile_rows = 128
+    tile_bytes = 256  # 512 FP4 values
+    packed_k = weight.shape[-1]
+    full_tiles, tail_bytes = divmod(packed_k, tile_bytes)
+    source = weight.reshape(-1, tile_rows, packed_k)
+    packed = torch.empty_like(weight, memory_format=torch.contiguous_format)
+    dest = packed.view(-1, tile_rows * packed_k)
+    if full_tiles:
+        full_bytes = full_tiles * tile_bytes
+        tiles = source[:, :, :full_bytes].unflatten(-1, (full_tiles, tile_bytes)).transpose(1, 2)
+        dest[:, :tile_rows * full_bytes].view(-1, full_tiles, tile_rows, tile_bytes).copy_(tiles)
+    if tail_bytes:
+        dest[:, -tile_rows * tail_bytes:].view(-1, tile_rows, tail_bytes).copy_(source[:, :, -tail_bytes:])
+    return packed
+
+
 def _scale_fp4_weight_sf(sf: torch.Tensor) -> torch.Tensor:
     # Internal dequant emits FP4 values divided by 64, so compensate once in the weight layout.
     exponent_bias = 6
@@ -149,6 +167,8 @@ def transform_weights_for_mega_moe(
     l2_w = _reshape_weights(l2_w)
     l2_sf = _reshape_weights(l2_sf).transpose(-1, -2).contiguous()
     if l1_w.dtype == torch.int8:
+        l1_w = _pack_fp4_weights(l1_w)
+        l2_w = _pack_fp4_weights(l2_w)
         l1_sf = _scale_fp4_weight_sf(l1_sf)
         l2_sf = _scale_fp4_weight_sf(l2_sf)
     l1_transformed = (l1_w, l1_sf)

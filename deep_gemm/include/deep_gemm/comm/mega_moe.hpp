@@ -5,6 +5,8 @@
 
 #include <c_api/asc_simd.h>
 #include <simt_api/device_functions.h>
+#include <utils/debug/asc_printf.h>
+#include <utils/debug/asc_assert.h>
 
 namespace deep_gemm::mega_moe::comm {
 

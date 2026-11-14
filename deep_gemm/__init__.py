@@ -153,7 +153,13 @@ from .locality_domain import (
     destroy_localizer,
 )
 
-# TileLang kernel implementations
-from .tilelang_ops import tf32_hc_prenorm_gemm
+def tf32_hc_prenorm_gemm(a: torch.Tensor,
+                       b: torch.Tensor,
+                       d: torch.Tensor,
+                       sqr_sum: torch.Tensor,
+                       num_splits: int | None = None) -> None:
+    """Load the optional TileLang HC kernel only when it is used."""
+    from .tilelang_ops import tf32_hc_prenorm_gemm as implementation
+    return implementation(a, b, d, sqr_sum, num_splits)
 
 _C.init(__version__, get_library_root_path())

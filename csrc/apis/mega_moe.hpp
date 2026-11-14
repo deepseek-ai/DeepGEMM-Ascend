@@ -13,6 +13,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/torch.h>
+#include <torch_npu/csrc/aten/common/from_blob.h>
 
 #include <deep_gemm/layout/mega_moe.hpp>
 
@@ -41,7 +42,7 @@ static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                               num_topk, hidden, intermediate_hidden}};
 }
 
-// The root Tensor owns the HCCL lease; data views borrow its memory
+// Each data view retains the root Tensor and its HCCL lease.
 struct SymmBuffer {
     torch::Tensor buffer;
     std::vector<int64_t> buffer_ptrs;
@@ -52,7 +53,7 @@ struct SymmBuffer {
         int32_t device_idx;
         DJ_ACL_CHECK(aclrtGetDevice(&device_idx));
         const c10::Device device(c10::DeviceType::PrivateUse1, device_idx);
-        buffer = torch::from_blob(allocation->buffer, {num_bytes}, [allocation, device](void*) {
+        buffer = at_npu::native::from_blob(allocation->buffer, {num_bytes}, [allocation, device](void*) {
             // Wait for device work before the last owner returns the lease to the pool
             const c10::DeviceGuard guard(device);
             DJ_ACL_CHECK(aclrtSynchronizeDevice());
@@ -66,7 +67,8 @@ static torch::Tensor slice_buffer(const torch::Tensor& buffer, uint64_t offset,
     DJ_HOST_ASSERT(buffer.dim() == 1 and buffer.scalar_type() == torch::kInt8 and buffer.is_contiguous());
     const auto num_bytes = c10::multiply_integers(shape) * c10::elementSize(dtype);
     DJ_HOST_ASSERT(offset <= buffer.nbytes() and num_bytes <= buffer.nbytes() - offset);
-    return torch::from_blob(static_cast<uint8_t*>(buffer.data_ptr()) + offset, shape, buffer.options().dtype(dtype));
+    return at_npu::native::from_blob(static_cast<uint8_t*>(buffer.data_ptr()) + offset, shape,
+                                     [buffer](void*) {}, buffer.options().dtype(dtype));
 }
 
 static auto get_symm_buffer_size_for_mega_moe(
