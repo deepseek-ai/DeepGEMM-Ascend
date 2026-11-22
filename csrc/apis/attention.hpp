@@ -31,7 +31,7 @@ static void validate_sparse_indices(const torch::Tensor& sparse_kv_block_indices
     DJ_HOST_ASSERT(runtime->get_dry_run() or sparse_kv_block_indices.device().type() == c10::DeviceType::PrivateUse1);
     DJ_HOST_ASSERT(sparse_kv_block_indices.dim() == 2 and sparse_kv_block_indices.scalar_type() == torch::kInt and sparse_kv_block_indices.is_contiguous());
     DJ_HOST_ASSERT(sparse_kv_block_indices.size(0) > 0 and sparse_kv_block_indices.size(0) <= std::numeric_limits<int32_t>::max());
-    DJ_HOST_ASSERT(sparse_kv_block_indices.size(1) > 0 and sparse_kv_block_indices.size(1) <= 4096);
+    DJ_HOST_ASSERT(sparse_kv_block_indices.size(1) > 0 and static_cast<uint64_t>(sparse_kv_block_indices.size(1)) * sparse_block_kv < 65536);
     DJ_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
     DJ_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
 }
@@ -191,7 +191,7 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(
     DJ_HOST_ASSERT(num_q_tokens > 0 and num_q_tokens <= std::numeric_limits<int32_t>::max());
     const auto num_heads = q_data.size(1);
     DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 32 and num_heads % 4 == 0);
-    DJ_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks <= 4096);
+    DJ_HOST_ASSERT(num_max_sparse_blocks > 0 and static_cast<uint64_t>(num_max_sparse_blocks) * sparse_block_kv < 65536);
     check_sparse_mqa_q_and_weights(q_data, q.second, weights, num_q_tokens, num_heads);
     const auto& sf_q = q.second.value();
 

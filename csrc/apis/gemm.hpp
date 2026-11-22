@@ -314,7 +314,7 @@ static void m_grouped_fp8_fp4_gemm_contiguous(
         recipe, recipe_a, recipe_b,
         grouped_layout, compiled_dims,
         disable_ue8m0_cast,
-        expected_m_for_psum_layout.value_or(0u)
+        expected_m_for_psum_layout
     );
     if (!maybe_desc.has_value()) return;
     dispatch_fp8_fp4_gemm(maybe_desc.value());
