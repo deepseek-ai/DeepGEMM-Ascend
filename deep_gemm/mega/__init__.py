@@ -25,7 +25,7 @@ class SymmBuffer:
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
                  base: 'SymmBuffer | None' = None):
-        assert mma_type == 'fp8xfp4', 'Ascend MegaMoE currently supports only fp8xfp4'
+        assert mma_type in ('fp8xfp4', 'fp4xfp4'), 'Ascend MegaMoE supports fp8xfp4 and routed fp4xfp4'
         assert activation == 'swiglu', 'Ascend MegaMoE currently supports only swiglu'
         self.group = group
         self.num_experts = num_experts
@@ -57,7 +57,7 @@ class SymmBuffer:
         (self.x, self.x_sf, self.topk_idx, self.topk_weights,
          self.shared_l1_acts, self.shared_l1_acts_sf, self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf, self.l2_acts, self.l2_acts_sf,
-         self._expert_recv_count) = slice_input_buffers(self.buffer)
+         self._expert_recv_count, self.routed_x, self.routed_x_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self) -> None:
         """Drop this owner's references; views require another live owner of the allocation."""
@@ -70,6 +70,7 @@ class SymmBuffer:
         self.shared_l2_acts = self.shared_l2_acts_sf = None
         self.l1_acts = self.l1_acts_sf = None
         self.l2_acts = self.l2_acts_sf = None
+        self.routed_x = self.routed_x_sf = None
         self._expert_recv_count = None
 
     @property
@@ -129,7 +130,8 @@ def _scale_fp4_weight_sf(sf: torch.Tensor) -> torch.Tensor:
 def transform_weights_for_mega_moe(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
     l2_weights: tuple[torch.Tensor, torch.Tensor],
-    activation: str = 'swiglu'
+    activation: str = 'swiglu',
+    native_fp4: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """Transform routed FP4 or shared FP8 (weight, scale) pairs."""
     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
@@ -148,7 +150,8 @@ def transform_weights_for_mega_moe(
     l1_sf = _interleave_weights(l1_sf).transpose(-1, -2).contiguous()
     l2_w = _reshape_weights(l2_w)
     l2_sf = _reshape_weights(l2_sf).transpose(-1, -2).contiguous()
-    if l1_w.dtype == torch.int8:
+    # The FP8 unpack path stores FP4/64 and compensates with +6. Native MXFP4 uses the original scales.
+    if l1_w.dtype == torch.int8 and not native_fp4:
         l1_sf = _scale_fp4_weight_sf(l1_sf)
         l2_sf = _scale_fp4_weight_sf(l2_sf)
     l1_transformed = (l1_w, l1_sf)
@@ -180,5 +183,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.hidden, sym_buffer.intermediate_hidden, sym_buffer.num_shared_experts,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        sym_buffer.mma_type,
     )

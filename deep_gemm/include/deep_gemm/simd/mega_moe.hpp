@@ -199,4 +199,81 @@ __simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t 
     }
 }
 
+__aicore__ inline float mxfp4_load_bf16(__ubuf__ bfloat16_t* ptr) {
+    const uint32_t wide = static_cast<uint32_t>(*reinterpret_cast<__ubuf__ uint16_t*>(ptr)) << 16;
+    return __builtin_bit_cast(float, wide);
+}
+
+__aicore__ inline int mxfp4_exponent(float amax) {
+    if (!(amax > 0.f))
+        return 0;
+    const uint32_t bits = __builtin_bit_cast(uint32_t, amax * (1.f / 6.f));
+    const uint32_t biased = (bits >> 23) & 255u;
+    if (biased == 0 || biased == 255)
+        return 0;
+    const int floor_log = static_cast<int>(biased) - 127;
+    const int exp = floor_log + ((bits & 0x7fffffu) != 0 ? 1 : 0);
+    return exp < -127 ? -127 : (exp > 127 ? 127 : exp);
+}
+
+// RNE ties: 0.25, 1.25, 2.5 and 5 stay on the even code.
+__aicore__ inline int mxfp4_e2m1(float value) {
+    const float magnitude = value < 0.f ? -value : value;
+    int code = 7;
+    if (magnitude <= 0.25f) code = 0;
+    else if (magnitude < 0.75f) code = 1;
+    else if (magnitude <= 1.25f) code = 2;
+    else if (magnitude < 1.75f) code = 3;
+    else if (magnitude <= 2.5f) code = 4;
+    else if (magnitude < 3.5f) code = 5;
+    else if (magnitude <= 5.f) code = 6;
+    if (value < 0.f)
+        code |= 8;
+    return code;
+}
+
+// Routed SwiGLU -> MXFP4 E2M1/K32. Low nibble is even K. Scale byte is exponent+127, low byte first.
+template <uint32_t kScaleStride>
+__aicore__ inline void quant_swiglu_mxfp4(__ubuf__ bfloat16_t* rows, __ubuf__ uint8_t* packed,
+                                          __ubuf__ int16_t* scales, __ubuf__ float* route_weights,
+                                          uint32_t row_base, uint32_t valid_m, float activation_clamp) {
+    constexpr uint32_t kOutCols = layout::BLOCK_N / 2;
+
+    for (uint32_t row = 0; row < valid_m; ++ row) {
+        const float route = route_weights[row];
+        __ubuf__ bfloat16_t* gate = rows + static_cast<uint64_t>(row) * layout::BLOCK_N;
+        __ubuf__ bfloat16_t* up = gate + kOutCols;
+        __ubuf__ uint8_t* dst = packed + static_cast<uint64_t>(row) * (kOutCols / 2);
+        int previous_exp = 0;
+        for (uint32_t group = 0; group < kOutCols / 32; ++ group) {
+            float values[32];
+            float amax = 0.f;
+            for (uint32_t lane = 0; lane < 32; ++ lane) {
+                float gate_value = mxfp4_load_bf16(gate + group * 32 + lane);
+                float up_value = mxfp4_load_bf16(up + group * 32 + lane);
+                if (gate_value > activation_clamp) gate_value = activation_clamp;
+                if (up_value > activation_clamp) up_value = activation_clamp;
+                if (up_value < -activation_clamp) up_value = -activation_clamp;
+                const float activated = gate_value / (1.f + __builtin_expf(-gate_value)) * up_value * route;
+                values[lane] = activated;
+                const float magnitude = activated < 0.f ? -activated : activated;
+                if (magnitude > amax) amax = magnitude;
+            }
+            const int exponent = mxfp4_exponent(amax);
+            const float inv_scale = __builtin_bit_cast(float, static_cast<uint32_t>(127 - exponent) << 23);
+            for (uint32_t lane = 0; lane < 32; lane += 2) {
+                const int low = mxfp4_e2m1(values[lane] * inv_scale);
+                const int high = mxfp4_e2m1(values[lane + 1] * inv_scale);
+                dst[group * 16 + lane / 2] = static_cast<uint8_t>(low | (high << 4));
+            }
+            if ((group & 1u) != 0) {
+                const uint32_t pair = group / 2;
+                scales[pair * kScaleStride + row_base + row] = static_cast<int16_t>(
+                    static_cast<uint16_t>(previous_exp + 127) | (static_cast<uint16_t>(exponent + 127) << 8));
+            }
+            previous_exp = exponent;
+        }
+    }
+}
+
 } // namespace deep_gemm::mega_moe

@@ -41,6 +41,8 @@ struct Config {
     uint32_t num_topk;
     uint32_t hidden;
     uint32_t intermediate_hidden;
+    // 1: routed activations are MXFP8. 2: routed activations are packed MXFP4, two E2M1 values per byte.
+    uint32_t routed_elem_pack = 1;
 
     const uint32_t shared_intermediate_hidden = num_shared_experts * intermediate_hidden;
     const uint32_t num_input_sf_pairs = hidden / MX_SF_DIVISOR;
@@ -110,8 +112,9 @@ public:
         Buffer<fp8_t> data;
         Buffer<int16_t> sf;
 
-        constexpr __aicore__ FP8Buffer(uint64_t& offset, uint64_t num_rows, uint32_t num_cols):
-            data{offset, num_rows * num_cols, kNumBufferAlignmentBytes},
+        // elem_pack 2 stores two E2M1 values in each data byte. Scales stay one UE8M0 per 32 elements.
+        constexpr __aicore__ FP8Buffer(uint64_t& offset, uint64_t num_rows, uint32_t num_cols, uint32_t elem_pack = 1):
+            data{offset, num_rows * num_cols / elem_pack, kNumBufferAlignmentBytes},
             sf{offset, num_rows * ceil_div(num_cols, MX_SF_DIVISOR), kNumBufferAlignmentBytes} {}
     };
 
@@ -195,10 +198,10 @@ public:
         FP8Buffer l2_acts;
         Buffer<bf16_t> output;
     } routed{
-        .l1_acts = {next_offset, num_ring_rows, config.hidden},
+        .l1_acts = {next_offset, num_ring_rows, config.hidden, config.routed_elem_pack},
         .topk_weights = {next_offset, num_full_pool_rows, kNumBufferAlignmentBytes},
         .src_metadata = {next_offset, num_full_pool_rows, kNumBufferAlignmentBytes},
-        .l2_acts = {next_offset, num_ring_rows, config.intermediate_hidden},
+        .l2_acts = {next_offset, num_ring_rows, config.intermediate_hidden, config.routed_elem_pack},
         .output = {next_offset, num_ring_rows * config.hidden, kNumBufferAlignmentBytes},
     };
 
@@ -213,6 +216,16 @@ public:
     // Producer M-block for each input route; dispatch fills this before publishing readiness
     Buffer<uint32_t> route_m_blocks{
         next_offset, static_cast<uint64_t>(config.num_max_tokens_per_rank) * config.num_topk, kNumBufferAlignmentBytes};
+
+    // Host-written MXFP4 routed activations. Empty when routed_elem_pack is 1, so the FP8 layout does not move.
+    Buffer<uint8_t> routed_fp4_acts{
+        next_offset,
+        config.routed_elem_pack == 2 ? static_cast<uint64_t>(config.num_max_tokens_per_rank) * (config.hidden / 2) : 0,
+        config.routed_elem_pack == 2 ? kNumBufferAlignmentBytes : 1};
+    Buffer<int16_t> routed_fp4_sf{
+        next_offset,
+        config.routed_elem_pack == 2 ? static_cast<uint64_t>(config.num_max_tokens_per_rank) * config.num_input_sf_pairs : 0,
+        config.routed_elem_pack == 2 ? kNumBufferAlignmentBytes : 1};
 
     constexpr __aicore__ uint64_t get_num_max_m_blocks() const {
         return ceil_div(static_cast<uint64_t>(config.num_ranks) * config.num_max_tokens_per_rank * config.num_topk, BLOCK_M) + config.num_experts / config.num_ranks;
@@ -250,9 +263,10 @@ public:
 };
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kRoutedPack = 1>
 inline constexpr Workspace kWorkspace{{
-    kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden}};
+    kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden, kRoutedPack}};
 
 template <const auto& workspace>
 constexpr __aicore__ uint32_t get_ring_block_idx(uint32_t pool_block_idx) {

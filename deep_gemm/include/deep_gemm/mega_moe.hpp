@@ -316,6 +316,10 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
 
     static_assert(ub_nz.offset(kNumNZStages) <= UBSizeBytes and ub_reduce_inputs.shape_n > 0, "AIV0 UB overflow");
 
+    // Native MXFP4 loads packed weights on AIC. The final combine still reduces every token.
+    if constexpr (workspace.config.routed_elem_pack == 2)
+        return;
+
     // Initialize UB reuse credits; AIC releases the initial L1B credits
     notify<PIPE_V, PIPE_MTE2, kNumFP4Stages>(kFP4Empty);
     notify<PIPE_MTE3, PIPE_V, kNumNZStages>(kNZEmpty);
@@ -424,7 +428,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     notify<PIPE_M, PIPE_MTE1, kNumL0Stages>(kL0BEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumL1AStages>(kL1AEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumSFStages>(kSFEmpty);
-    if constexpr (kHasSharedExperts)
+    if constexpr (kHasSharedExperts or config.routed_elem_pack == 2)
         notify<PIPE_MTE1, PIPE_MTE2, 3>(kSharedL1BEmpty);
 
     sched::LinearTaskState schedule;
@@ -476,11 +480,13 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         const uint64_t sf_offset = weight_block_idx * num_sf_pairs * BLOCK_N;
         const auto task_weights = is_linear1 ? (is_shared ? weights.shared_l1 : weights.l1) : (is_shared ? weights.shared_l2 : weights.l2);
 
-        // Hand L1B over to AIV0 after shared tasks
-        if (not is_shared and not routed_l1b_initialized) {
-            l1b_stage_idx = 0;
-            notify_intra_block<PIPE_MTE1, 0, kNumL1BStages>(kL1BEmpty);
-            routed_l1b_initialized = true;
+        // Hand L1B over to AIV0 after shared tasks. MXFP4 routed weights stay on AIC.
+        if constexpr (config.routed_elem_pack == 1) {
+            if (not is_shared and not routed_l1b_initialized) {
+                l1b_stage_idx = 0;
+                notify_intra_block<PIPE_MTE1, 0, kNumL1BStages>(kL1BEmpty);
+                routed_l1b_initialized = true;
+            }
         }
 
         // Select input data and scales
@@ -489,20 +495,22 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
             (is_shared ? workspace.input.acts : workspace.routed.l1_acts) :
             (is_shared ? workspace.shared_l2_acts : workspace.routed.l2_acts);
         const uint64_t input_m_idx = static_cast<uint64_t>(input_block_idx) * BLOCK_M;
-        const auto input = input_layout.data.get_ptr(buffer, input_m_idx * num_k);
+        const uint32_t act_pack = (config.routed_elem_pack == 2 and not is_shared) ? 2u : 1u;
+        const auto input = input_layout.data.get_ptr(buffer, input_m_idx * (num_k / act_pack));
         const auto input_sf = input_layout.sf.get_ptr(buffer, input_m_idx * num_sf_pairs);
 
-        const auto compute = [&]<uint32_t MAD_M>() __aicore__ {
+        const auto compute = [&]<uint32_t MAD_M, bool kFP4>() __aicore__ {
+            using ab_t = std::conditional_t<kFP4, float4_e2m1x2_t, float8_e4m3_t>;
             constexpr uint32_t BLOCK_K = MMAConfig<MAD_M>::BLOCK_K;
             constexpr uint32_t MAD_K = MMAConfig<MAD_M>::MAD_K;
             constexpr uint32_t MAD_N = MMAConfig<MAD_M>::MAD_N;
             constexpr auto l0_full = BLOCK_N == MAD_N ? kL0AFull : kL0BFull;
             constexpr uint32_t kNumSharedL1BStages = MMAConfig<MAD_M>::get_num_shared_l1b_stages();
-            constexpr l1_ptr<float8_e4m3_t, Major::K> l1a(MAD_M, BLOCK_K, 0);
-            constexpr l1_ptr<float8_e4m3_t, Major::K> l1b(MAD_N, BLOCK_K, l1a.offset(kNumL1AStages));
-            constexpr l1_ptr<float8_e4m3_t, Major::K> shared_l1b(BLOCK_N, BLOCK_K, l1b.addr);
-            constexpr l0a_ptr<float8_e4m3_t> l0a(MAD_M, MAD_K);
-            constexpr l0b_ptr<float8_e4m3_t> l0b(MAD_N, MAD_K);
+            constexpr l1_ptr<ab_t, Major::K> l1a(MAD_M, BLOCK_K, 0);
+            constexpr l1_ptr<ab_t, Major::K> l1b(MAD_N, BLOCK_K, l1a.offset(kNumL1AStages));
+            constexpr l1_ptr<ab_t, Major::K> shared_l1b(BLOCK_N, BLOCK_K, l1b.addr);
+            constexpr l0a_ptr<ab_t> l0a(MAD_M, MAD_K);
+            constexpr l0b_ptr<ab_t> l0b(MAD_N, MAD_K);
             constexpr l0c_ptr<float> l0c(MAD_M, MAD_N);
 
             for (uint32_t k_idx = 0; k_idx < num_k; k_idx += BLOCK_K) {
@@ -511,16 +519,23 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 const uint32_t sf_pair_idx = k_idx / MX_SF_DIVISOR;
                 const uint32_t num_chunk_pairs = min(kNumSFPairsPerChunk, num_sf_pairs - sf_pair_idx);
 
-                // Load shared FP8 weights
-                if (is_shared) {
+                // Shared weights are FP8 NZ. Routed MXFP4 weights are packed E2M1 and converted by nd2nz.
+                if (is_shared or kFP4) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSharedL1BEmpty, l1b_stage_idx);
-                    const uint64_t weight_offset = weight_block_idx * BLOCK_N * num_k;
-                    asc_set_gm2l1_loop_size(1, 1);
-                    asc_copy_gm2l1_align(shared_l1b[l1b_stage_idx].template ptr<uint8_t>(),
-                                         const_cast<__gm__ uint8_t*>(task_weights.data + weight_offset + k_idx * BLOCK_N),
-                                         1, BLOCK_N * valid_k, 0, 0, false,
-                                         reuse_shared_weights ? asc_load_l2_cache_mode::NORMAL_LAST_VICTIM : asc_load_l2_cache_mode::NOTALLOC_KEEP,
-                                         BLOCK_N * BLOCK_K, BLOCK_N * BLOCK_K);
+                    if constexpr (kFP4) {
+                        const uint64_t weight_offset = weight_block_idx * BLOCK_N * (num_k / 2) + k_idx / 2;
+                        copy_gm_to_l1(shared_l1b[l1b_stage_idx],
+                                      gm_ptr<float4_e2m1x2_t, Major::K>(num_k / 2, reinterpret_cast<uintptr_t>(task_weights.data) + weight_offset),
+                                      BLOCK_N, valid_k, weight_sf_l2_hint);
+                    } else {
+                        const uint64_t weight_offset = weight_block_idx * BLOCK_N * num_k;
+                        asc_set_gm2l1_loop_size(1, 1);
+                        asc_copy_gm2l1_align(shared_l1b[l1b_stage_idx].template ptr<uint8_t>(),
+                                             const_cast<__gm__ uint8_t*>(task_weights.data + weight_offset + k_idx * BLOCK_N),
+                                             1, BLOCK_N * valid_k, 0, 0, false,
+                                             reuse_shared_weights ? asc_load_l2_cache_mode::NORMAL_LAST_VICTIM : asc_load_l2_cache_mode::NOTALLOC_KEEP,
+                                             BLOCK_N * BLOCK_K, BLOCK_N * BLOCK_K);
+                    }
                     notify<PIPE_MTE2, PIPE_MTE1>(kSharedL1BFull, l1b_stage_idx);
                 }
 
@@ -542,7 +557,8 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 // Load activations and scales
                 wait<PIPE_MTE1, PIPE_MTE2>(kL1AEmpty, l1a_stage_idx);
                 copy_gm_to_l1(l1a[l1a_stage_idx],
-                              gm_ptr<float8_e4m3_t, Major::K>(num_k, reinterpret_cast<uintptr_t>(input + k_idx)),
+                              gm_ptr<ab_t, Major::K>(kFP4 ? num_k / 2 : num_k,
+                                                     reinterpret_cast<uintptr_t>(input) + (kFP4 ? k_idx / 2 : k_idx)),
                               valid_m, valid_k, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
                 notify<PIPE_MTE2, PIPE_MTE1>(kL1AFull, l1a_stage_idx);
 
@@ -563,7 +579,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
                 // Wait for L1 inputs
                 wait<PIPE_MTE2, PIPE_MTE1>(kL1AFull, l1a_stage_idx);
-                if (is_shared) {
+                if (is_shared or kFP4) {
                     wait<PIPE_MTE2, PIPE_MTE1>(kSharedL1BFull, l1b_stage_idx);
                 } else {
                     for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N)
@@ -587,8 +603,8 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                         const uint32_t l0c_idx = n_mad_idx / MAD_N;
                         const uint32_t l0b_stage_idx = (l0a_stage_idx * (BLOCK_N / MAD_N) + l0c_idx) % kNumL0Stages;
                         wait<PIPE_M, PIPE_MTE1>(kL0BEmpty, l0b_stage_idx);
-                        const auto l1b_src = is_shared ? shared_l1b[l1b_stage_idx] : l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
-                        copy_l1_to_l0b(l0b[l0b_stage_idx], l1b_src, is_shared ? n_mad_idx : 0, k_mad_idx);
+                        const auto l1b_src = (is_shared or kFP4) ? shared_l1b[l1b_stage_idx] : l1b[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages];
+                        copy_l1_to_l0b(l0b[l0b_stage_idx], l1b_src, (is_shared or kFP4) ? n_mad_idx : 0, k_mad_idx);
                         copy_l1_to_l0b_mx(l0b[l0b_stage_idx], l1_sfb[sf_stage_idx], n_mad_idx, sf_pair_idx_in_chunk, MAD_K);
                         notify<PIPE_MTE1, PIPE_M>(l0_full, l0b_stage_idx);
 
@@ -638,7 +654,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 }
 
                 // Release L1 after the last L0 load
-                if (is_shared) {
+                if (is_shared or kFP4) {
                     notify<PIPE_MTE1, PIPE_MTE2>(kSharedL1BEmpty, l1b_stage_idx);
                     l1b_stage_idx = (l1b_stage_idx + 1) % kNumSharedL1BStages;
                 } else {
@@ -657,10 +673,22 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 
         };
         // Shared tasks keep one shape so their L1B stages retain the same physical stride
-        if ((is_shared ? num_tokens : valid_m) <= 128)
-            compute.template operator()<128>();
-        else
-            compute.template operator()<256>();
+        if constexpr (config.routed_elem_pack == 2) {
+            if (is_shared) {
+                if (num_tokens <= 128)
+                    compute.template operator()<128, false>();
+                else
+                    compute.template operator()<256, false>();
+            } else if (valid_m <= 128) {
+                compute.template operator()<128, true>();
+            } else {
+                compute.template operator()<256, true>();
+            }
+        } else if ((is_shared ? num_tokens : valid_m) <= 128) {
+            compute.template operator()<128, false>();
+        } else {
+            compute.template operator()<256, false>();
+        }
 
         asc_store_dev(num_issued_gemms_ptr, ++ num_issued_gemms);
     }
@@ -834,21 +862,29 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
             const uint32_t token_topk_idx = static_cast<uint32_t>(token_metadata);
             const uint32_t src_token_idx = token_topk_idx / config.num_topk;
             const uint32_t src_topk_idx = token_topk_idx % config.num_topk;
-            const auto remote_token = workspace.input.acts.data.get_ptr(remote_base, static_cast<uint64_t>(src_token_idx) * config.hidden);
-            const auto remote_sf = workspace.input.acts.sf.get_ptr(remote_base, static_cast<uint64_t>(src_token_idx) * config.num_input_sf_pairs);
-
-            // Pull token data and scales
-            copy_gm_to_ub(ub_pull_token[stage_idx].ptr(), remote_token,
-                          1, config.hidden, config.hidden, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+            // MXFP4 dispatch carries packed E2M1 activations. The FP8 path carries one byte per element.
+            constexpr uint32_t kActBytes = config.routed_elem_pack == 2 ? config.hidden / 2 : config.hidden;
+            const auto remote_sf = (config.routed_elem_pack == 2 ? workspace.routed_fp4_sf : workspace.input.acts.sf).get_ptr(
+                remote_base, static_cast<uint64_t>(src_token_idx) * config.num_input_sf_pairs);
+            auto* pull_bytes = reinterpret_cast<__ubuf__ uint8_t*>(ub_pull_token[stage_idx].ptr());
+            if constexpr (config.routed_elem_pack == 2) {
+                const auto remote_token = workspace.routed_fp4_acts.get_ptr(
+                    remote_base, static_cast<uint64_t>(src_token_idx) * kActBytes);
+                copy_gm_to_ub(pull_bytes, remote_token, 1, kActBytes, kActBytes, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+            } else {
+                const auto remote_token = workspace.input.acts.data.get_ptr(
+                    remote_base, static_cast<uint64_t>(src_token_idx) * kActBytes);
+                copy_gm_to_ub(ub_pull_token[stage_idx].ptr(), remote_token,
+                              1, kActBytes, kActBytes, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+            }
             copy_gm_to_ub(ub_pull_sf[stage_idx].ptr(), remote_sf, 1, config.num_input_sf_pairs,
                           config.num_input_sf_pairs * sizeof(int16_t), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
             notify<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
 
             // Stage routed inputs
             wait<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
-            copy_ub_to_gm(l1_acts + ring_m_idx * config.hidden,
-                          ub_pull_token[stage_idx].ptr(), 1, config.hidden,
-                          config.hidden, kWriteThroughShare);
+            copy_ub_to_gm(reinterpret_cast<__gm__ uint8_t*>(l1_acts) + ring_m_idx * kActBytes,
+                          pull_bytes, 1, kActBytes, kActBytes, kWriteThroughShare);
             copy_ub_to_gm(l1_acts_sf + ring_m_idx * config.num_input_sf_pairs,
                           ub_pull_sf[stage_idx].ptr(), 1, config.num_input_sf_pairs,
                           config.num_input_sf_pairs * sizeof(int16_t), kWriteThroughShare);
@@ -934,12 +970,22 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                     wait<PIPE_MTE2, PIPE_V>(kTopkFull);
             }
 
-            // Quantize one row group
+            // Quantize one row group. Routed MXFP4 uses E2M1/K32; shared stays MXFP8.
             const auto input = ub_accum[stage_idx].ptr() + m_idx_in_stage * BLOCK_N;
             const auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(ub_accum[stage_idx].ptr()) +
                                 m_idx_in_stage * (BLOCK_N / 2);
             const auto output_sf = ub_output_sf[stage_idx].ptr() + m_idx_in_stage;
-            if (is_shared) {
+            if constexpr (config.routed_elem_pack == 2) {
+                if (is_shared) {
+                    vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
+                } else {
+                    quant_swiglu_mxfp4<STORE_BLOCK_M>(
+                        input, reinterpret_cast<__ubuf__ uint8_t*>(ub_accum[stage_idx].ptr()) + m_idx_in_stage * (BLOCK_N / 4),
+                        ub_output_sf[stage_idx].ptr(), ub_route_weights.ptr() + m_idx_in_stage,
+                        m_idx_in_stage, step_m, activation_clamp);
+                    asc_sync_pipe(PIPE_ALL);
+                }
+            } else if (is_shared) {
                 vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
             } else {
                 vf_swiglu_quant<true, STORE_BLOCK_M>(input, output, output_sf, ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
@@ -959,13 +1005,20 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                 const auto dst_layout = is_shared ? workspace.shared_l2_acts : workspace.routed.l2_acts;
                 const uint32_t num_cols = num_n_blocks * (BLOCK_N / 2);
                 const uint32_t num_sf_pairs = num_cols / MX_SF_DIVISOR;
+                const uint32_t store_pack = (config.routed_elem_pack == 2 and not is_shared) ? 2u : 1u;
                 const auto dst = dst_layout.data.get_ptr(buffer,
-                    (output_m_idx + stage_m_begin) * num_cols + n_block_idx * (BLOCK_N / 2));
+                    (output_m_idx + stage_m_begin) * (num_cols / store_pack) + n_block_idx * ((BLOCK_N / 2) / store_pack));
                 const auto dst_sf = dst_layout.sf.get_ptr(buffer,
                     output_m_idx * num_sf_pairs + n_block_idx * kNumOutputSFPairs * BLOCK_M + stage_m_begin);
 
-                copy_ub_to_gm(dst, ub_ptr<float8_e4m3_t>(STORE_BLOCK_M, BLOCK_N / 2, ub_accum[stage_idx].addr),
-                              stage_valid_m, BLOCK_N / 2, num_cols, kWriteThroughShare);
+                if (store_pack == 2) {
+                    copy_ub_to_gm(reinterpret_cast<__gm__ uint8_t*>(dst),
+                                  ub_ptr<uint8_t>(STORE_BLOCK_M, BLOCK_N / 4, ub_accum[stage_idx].addr),
+                                  stage_valid_m, BLOCK_N / 4, num_cols / 2, kWriteThroughShare);
+                } else {
+                    copy_ub_to_gm(dst, ub_ptr<float8_e4m3_t>(STORE_BLOCK_M, BLOCK_N / 2, ub_accum[stage_idx].addr),
+                                  stage_valid_m, BLOCK_N / 2, num_cols, kWriteThroughShare);
+                }
                 copy_ub_to_gm(dst_sf, ub_output_sf[stage_idx],
                               kNumOutputSFPairs, stage_valid_m, BLOCK_M * sizeof(int16_t), kWriteThroughShare);
                 notify_intra_block<PIPE_MTE3, 1>(kEpilogueEmpty, stage_idx);
@@ -1123,7 +1176,8 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 }
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kRoutedPack = 1>
 __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ int32_t* cumulative_local_expert_recv_stats,
                                             __gm__ const uint8_t* l1_weights, __gm__ const int16_t* l1_weights_sf,
                                             __gm__ const uint8_t* l2_weights, __gm__ const int16_t* l2_weights_sf,
@@ -1132,7 +1186,7 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
                                             uint32_t num_tokens, float activation_clamp,
                                             layout::SymBuffer<> sym_buffer) {
     constexpr auto& workspace = layout::kWorkspace<kNumRanks, kNumExperts, kNumSharedExperts,
-                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden>;
+                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden, kRoutedPack>;
     constexpr auto& config = workspace.config;
 
     // Measured 32 MiB combine-work threshold for tail reduction

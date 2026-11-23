@@ -26,7 +26,8 @@ namespace py = pybind11;
 
 static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                                        uint32_t num_max_tokens_per_rank, uint32_t num_topk,
-                                       uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts) {
+                                       uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts,
+                                       uint32_t routed_elem_pack = 1) {
     DJ_HOST_ASSERT(num_ranks > 0 and num_ranks < 256);
     DJ_HOST_ASSERT(num_experts > 0 and num_experts % num_ranks == 0);
     DJ_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -37,8 +38,9 @@ static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                    intermediate_hidden % layout::BLOCK_N == 0);
     DJ_HOST_ASSERT(static_cast<uint64_t>(num_ranks) * num_max_tokens_per_rank * num_topk <
                    layout::kCountArrivalBit);
+    DJ_HOST_ASSERT(routed_elem_pack == 1 or routed_elem_pack == 2);
     return layout::Workspace{{num_ranks, num_experts, num_shared_experts, num_max_tokens_per_rank,
-                              num_topk, hidden, intermediate_hidden}};
+                              num_topk, hidden, intermediate_hidden, routed_elem_pack}};
 }
 
 // The root Tensor owns the HCCL lease; data views borrow its memory
@@ -73,9 +75,10 @@ static auto get_symm_buffer_size_for_mega_moe(
     uint32_t num_ranks, uint32_t num_experts, uint32_t num_max_tokens_per_rank, uint32_t num_topk,
     uint32_t hidden, uint32_t intermediate_hidden, const std::string& mma_type,
     const std::string& activation, uint32_t num_shared_experts = 0) {
-    DJ_HOST_ASSERT(mma_type == "fp8xfp4" and activation == "swiglu");
+    DJ_HOST_ASSERT((mma_type == "fp8xfp4" or mma_type == "fp4xfp4") and activation == "swiglu");
+    const uint32_t routed_elem_pack = mma_type == "fp4xfp4" ? 2u : 1u;
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+                                         hidden, intermediate_hidden, num_shared_experts, routed_elem_pack);
     auto slice_input_buffers = [workspace](const torch::Tensor& buffer) {
         DJ_HOST_ASSERT(buffer.nbytes() >= workspace.get_num_bytes());
         const auto& config = workspace.config;
@@ -83,6 +86,8 @@ static auto get_symm_buffer_size_for_mega_moe(
         const int64_t hidden = config.hidden, intermediate_hidden = config.intermediate_hidden;
         const int64_t num_ring_tokens = workspace.num_ring_rows;
         const int64_t shared_intermediate_hidden = config.shared_intermediate_hidden;
+        const int64_t pack = config.routed_elem_pack;
+        const auto routed_dtype = pack == 2 ? torch::kInt8 : torch::kFloat8_e4m3fn;
         auto x = slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden}, torch::kFloat8_e4m3fn);
         auto x_sf = slice_buffer(buffer, workspace.input.acts.sf.offset, {num_tokens, config.num_input_sf_pairs}, torch::kInt16);
         auto topk_idx = slice_buffer(buffer, workspace.input.topk_idx.offset, {num_tokens, config.num_topk}, torch::kInt64);
@@ -95,16 +100,21 @@ static auto get_symm_buffer_size_for_mega_moe(
         // Linear2 SFs are physical storage: [M-block, K-pair, M] with fixed BLOCK_M
         auto shared_l2_acts_sf = config.num_shared_experts > 0 ? slice_buffer(buffer, workspace.shared_l2_acts.sf.offset,
             {workspace.num_padded_shared_rows * (shared_intermediate_hidden / MX_SF_DIVISOR)}, torch::kInt16) : torch::Tensor();
-        auto l1_acts = slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden}, torch::kFloat8_e4m3fn);
+        auto l1_acts = slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden / pack}, routed_dtype);
         auto l1_acts_sf = slice_buffer(buffer, workspace.routed.l1_acts.sf.offset, {num_ring_tokens, config.num_input_sf_pairs}, torch::kInt16);
-        auto l2_acts = slice_buffer(buffer, workspace.routed.l2_acts.data.offset, {num_ring_tokens, intermediate_hidden}, torch::kFloat8_e4m3fn);
+        auto l2_acts = slice_buffer(buffer, workspace.routed.l2_acts.data.offset, {num_ring_tokens, intermediate_hidden / pack}, routed_dtype);
         auto l2_acts_sf = slice_buffer(buffer, workspace.routed.l2_acts.sf.offset,
             {num_ring_tokens * (intermediate_hidden / MX_SF_DIVISOR)}, torch::kInt16);
         auto expert_recv_count = slice_buffer(buffer, workspace.metadata.expert_recv_count.offset,
             {config.num_ranks, config.num_experts / config.num_ranks}, torch::kInt32);
+        auto routed_x = pack == 2 ? slice_buffer(buffer, workspace.routed_fp4_acts.offset,
+            {num_tokens, hidden / 2}, torch::kInt8) : torch::empty({0}, buffer.options());
+        auto routed_x_sf = pack == 2 ? slice_buffer(buffer, workspace.routed_fp4_sf.offset,
+            {num_tokens, config.num_input_sf_pairs}, torch::kInt16) : torch::empty({0}, buffer.options().dtype(torch::kInt16));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
-                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, expert_recv_count);
+                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, expert_recv_count,
+                               routed_x, routed_x_sf);
     };
     return std::make_tuple(workspace.get_num_bytes(), std::function(slice_input_buffers));
 }
@@ -140,7 +150,8 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::string& mma_type
 ) {
     // Config checks
     const auto [rm, rn, rk] = recipe;
@@ -150,8 +161,10 @@ static void fp8_fp4_mega_moe(
     DJ_HOST_ASSERT(hidden > 0 and intermediate_hidden > 0 and num_shared_experts >= 0);
     const auto num_ranks = static_cast<uint32_t>(sym_buffer_ptrs.size());
     // Use the registered layout dimensions, then validate tensors against them.
+    DJ_HOST_ASSERT(mma_type == "fp8xfp4" or mma_type == "fp4xfp4");
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+                                         hidden, intermediate_hidden, num_shared_experts,
+                                         mma_type == "fp4xfp4" ? 2u : 1u);
     DJ_HOST_ASSERT(y.dim() == 2 and y.size(0) <= num_max_tokens_per_rank and y.size(1) == hidden);
     DJ_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == (num_shared_experts > 0) and
                    shared_l2_weights_tuple_opt.has_value() == (num_shared_experts > 0));
@@ -221,7 +234,8 @@ static void register_apis(py::module_& m) {
           py::arg("sym_buffer_ptrs"), py::arg("rank_idx"), py::arg("num_max_tokens_per_rank"),
           py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"),
           py::arg("intermediate_hidden"), py::arg("num_shared_experts"), py::arg("recipe"),
-          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"));
+          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"),
+          py::arg("mma_type") = "fp8xfp4");
 }
 
 } // namespace deep_gemm::mega_moe

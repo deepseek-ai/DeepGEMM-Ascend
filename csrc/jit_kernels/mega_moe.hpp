@@ -28,12 +28,12 @@ static void launch_mega_moe(const MegaMoEArgs& args) {
 #include <deep_gemm/mega_moe.hpp>
 
 static void __instantiate() {{
-    auto p = reinterpret_cast<void*>(&deep_gemm::mega_moe::mega_moe_impl<{}, {}, {}, {}, {}, {}, {}>);
+    auto p = reinterpret_cast<void*>(&deep_gemm::mega_moe::mega_moe_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 
 )",
         config.num_ranks, config.num_experts, config.num_shared_experts, config.num_max_tokens_per_rank,
-        config.num_topk, config.hidden, config.intermediate_hidden);
+        config.num_topk, config.hidden, config.intermediate_hidden, config.routed_elem_pack);
     if (runtime->get_dry_run()) {
         jit->compile_without_load("mega_moe", code);
         return;
