@@ -422,7 +422,7 @@ __aicore__ inline void build_aiv_interval(
     asc_vf_call<find_prepare_range<kNumAICores>>(cce::dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(ub_workspace), aiv_idx);
     asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_V, PIPE_S, EVENT_ID0);
-    dcci(reinterpret_cast<__ubuf__ void*>(ub_workspace), cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_UB);
+    asc_ub_dcci_single(ub_workspace);
     auto ub_cursor = reinterpret_cast<__ubuf__ volatile PrepareCursor*>(ub_workspace);
     const uint64_t total_cost = ub_cursor->total_cost;
     const uint64_t cost_begin = (total_cost * core_idx + kNumAICores - 1) / kNumAICores;

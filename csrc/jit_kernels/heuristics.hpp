@@ -78,8 +78,8 @@ struct GemmDtype {
 };
 
 static GemmDtype get_gemm_dtype(const GemmDesc& d) {
-    const bool with_transform = dynamic_cast<const IdentityEpilogue*>(d.epilogue_class.get()) == nullptr;
-    int epilogue_elem_bits = (d.cd_dtype == at::kBFloat16 && !with_transform) || d.cd_dtype == at::kFloat8_e4m3fn ? 16 : 32;
+    const int epilogue_elem_bits = (d.cd_dtype == at::kBFloat16 && dynamic_cast<const IdentityEpilogue*>(d.epilogue_class.get())) ||
+                                   dynamic_cast<const FP8QuantizationEpilogue*>(d.epilogue_class.get()) ? 16 : 32;
     if (d.a_dtype == at::kBFloat16 && d.b_dtype == at::kBFloat16)
         return {.elem_bits=16, .epilogue_elem_bits=epilogue_elem_bits};
     if (d.a_dtype == kPackedFP4 && d.b_dtype == kPackedFP4)
@@ -87,6 +87,12 @@ static GemmDtype get_gemm_dtype(const GemmDesc& d) {
     DJ_HOST_ASSERT(d.a_dtype == at::kFloat8_e4m3fn);
     DJ_HOST_ASSERT(d.b_dtype == at::kFloat8_e4m3fn || d.b_dtype == kPackedFP4);
     return {.elem_bits=8, .epilogue_elem_bits=epilogue_elem_bits, .has_sf=true, .dequant_b=d.b_dtype == kPackedFP4};
+}
+
+static constexpr bool can_stochastic_round_fp8(const HWDesc& hw, int mad_m, int mad_n) {
+    const int step_bytes = 4 * hw.vector_reg_bytes;
+    return (step_bytes / static_cast<int>(sizeof(float))) % mad_n == 0 &&
+           static_cast<int64_t>(mad_m) * (mad_n / hw.sf_elements_per_pair) * static_cast<int64_t>(sizeof(uint16_t)) <= step_bytes;
 }
 
 static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const GemmDtype& dtype, int block_m, int block_n, int block_k) {
@@ -112,6 +118,7 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
     c.num_l0_stages = 2;
 
     const bool with_bias = dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) != nullptr;
+    const bool with_fp8_sr = dynamic_cast<const FP8StochasticRoundingEpilogue*>(d.epilogue_class.get()) != nullptr;
 
     // Search MAD_M, MAD_N, MAD_K
     // 1. at least 2 stage in L0C, to overlap mad and store
@@ -125,6 +132,7 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
         if (block_m % (split_m * align_m) || block_n % (split_n * align_n)) continue;
         const int mad_m = block_m / split_m, mad_n = block_n / split_n;
         if (mad_m * mad_n * sizeof(float) > L0CSizeBytes / 2) continue;
+        if (with_fp8_sr && !can_stochastic_round_fp8(hw, mad_m, mad_n)) continue;
 
         // Determine MAD_K:
         // 1. ensure enough l0a and l0b stages
@@ -186,7 +194,8 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
     const uint32_t num_aivs = dtype.dequant_b ? 1 : 2;
     const uint32_t num_cd_stages = (block_m / c.mad_m) * (block_n / c.mad_n);
     const uint32_t epilogue_bytes = c.mad_m * c.mad_n * dtype.epilogue_elem_bits / 8 +
-                                    (with_bias ? block_n * c10::elementSize(d.cd_dtype) : 0) + (with_fp8_cast ? c.mad_m * c.mad_n / 32 : 0);
+                                    (with_bias ? block_n * c10::elementSize(d.cd_dtype) : 0) +
+                                    (dynamic_cast<const FP8QuantizationEpilogue*>(d.epilogue_class.get()) ? c.mad_m * c.mad_n / 32 : 0);
     c.num_epilogue_stages = std::min<uint32_t>(hw.num_intra_block_events, UBSizeBytes / epilogue_bytes);
     const uint32_t num_batches = is_batched(d.gemm_type) || is_k_grouped(d.gemm_type) ? d.num_groups : 1;
     const uint64_t num_blocks = static_cast<uint64_t>(ceil_div(d.m, block_m)) * ceil_div(d.n, block_n) * num_batches;
@@ -195,10 +204,10 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
 
     // Select Cache Hints
     // TODO: smarter heuristics for L2 hints
-    const int num_m_blocks = ceil_div(d.m, block_m);
+    const int num_m_blocks = ceil_div(is_m_grouped(d.gemm_type) ? d.expected_m : d.m, block_m);
     const int num_n_blocks = ceil_div(d.n, block_n);
     c.l2_ctrl_a = num_n_blocks <= 2 && num_m_blocks > num_n_blocks ? asc_load_l2_cache_mode::NOTALLOC_KEEP : asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM;
-    c.l2_ctrl_b = num_m_blocks <= 2 && num_n_blocks > num_m_blocks ? asc_load_l2_cache_mode::NOTALLOC_KEEP : asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM;
+    c.l2_ctrl_b = num_m_blocks <= (is_m_grouped(d.gemm_type) ? 1 : 2) && num_n_blocks > num_m_blocks ? asc_load_l2_cache_mode::NOTALLOC_KEEP : asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM;
 
     return c;
 }
@@ -473,24 +482,36 @@ static auto get_gemm_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmC
 
 static int64_t get_gemm_output_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmConfig& c) {
     const auto hw = get_hw_desc();
-    const int64_t num_waves = ceil_div(int64_t(ceil_div(d.m, c.block_m)) * ceil_div(d.n, c.block_n), d.num_cores);
+    const int num_batches = is_batched(d.gemm_type) || is_k_grouped(d.gemm_type) ? d.num_groups : 1;
+    const int64_t num_waves = ceil_div(static_cast<int64_t>(ceil_div(d.m, c.block_m)) * ceil_div(d.n, c.block_n) * num_batches, d.num_cores);
     const int64_t num_values = int64_t(std::min(d.m, c.block_m)) * std::min(d.n, c.block_n);
     const int64_t bytes = num_values * dtype.epilogue_elem_bits / 8;
     const bool with_bias = dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) != nullptr;
+    const bool with_fp8_sr = dynamic_cast<const FP8StochasticRoundingEpilogue*>(d.epilogue_class.get()) != nullptr;
+    const int num_aivs = dtype.dequant_b ? 1 : 2;
     // AddBias owns one BLOCK_N row per AIV drain; its hooks preserve the existing overlap.
-    const int64_t bias_bytes = with_bias ? (dtype.dequant_b ? 1 : 2) *
-                               std::min(d.n, c.block_n) * c10::elementSize(d.cd_dtype) : 0;
+    const int64_t bias_bytes = with_bias ? num_aivs * std::min(d.n, c.block_n) * c10::elementSize(d.cd_dtype) : 0;
     const int64_t bias_ns = ceil_div(bias_bytes * hw.num_ai_cores, hw.gm_bw_gbps);
     const int64_t gm_bytes = num_values * c10::elementSize(d.cd_dtype) * (1 + d.acc)
                            + (d.cd_dtype == at::kFloat8_e4m3fn ? num_values / 32 : 0);
     const int64_t fix_ns = ceil_div(bytes * 1000, hw.l0c_to_ub_bytes_per_cycle * hw.aic_clock_mhz);
     const int64_t gm_ns = ceil_div(gm_bytes * hw.num_ai_cores, hw.gm_bw_gbps);
-    const int64_t vector_values = int64_t(align(std::min(d.m, c.block_m), c.mad_m)) * align(std::min(d.n, c.block_n), c.mad_n);
+    const int64_t vector_values = int64_t(std::min(d.m, c.block_m)) * align(std::min(d.n, c.block_n), c.mad_n);
     // Pure AddBias performs one vector add per FP32 vector; BF16 packing is fused into its store.
     const int64_t vector_ns = with_bias ? ceil_div(ceil_div(vector_values * sizeof(float), hw.vector_reg_bytes) * 1000, hw.aic_clock_mhz) : 0;
     if (with_bias && c.num_epilogue_stages >= 2 && num_waves >= 2)
         return num_waves * std::max(fix_ns, bias_ns + gm_ns + vector_ns);
-    return num_waves * (c.direct_store ? std::max(fix_ns, gm_ns) : std::max(fix_ns, bias_ns) + gm_ns + vector_ns);
+    int64_t cost = num_waves * (c.direct_store ? std::max(fix_ns, gm_ns) : std::max(fix_ns, bias_ns) + gm_ns + vector_ns);
+    if (with_fp8_sr) {
+        // FP8 SR runs one 96-cycle loop body per four FP32 vectors on each AIV MAD tile.
+        constexpr int kFP8SRStepCycles = 96;
+        const int num_mads = ceil_div(std::min<int>(d.m, c.block_m), c.mad_m) * ceil_div(std::min<int>(d.n, c.block_n), c.mad_n);
+        const int64_t mad_bytes = static_cast<int64_t>(std::min<int>(d.m, c.mad_m)) * c.mad_n * static_cast<int64_t>(sizeof(float));
+        const int64_t sr_cycles = ceil_div(num_waves * num_mads, num_aivs) *
+                                  ceil_div(mad_bytes, 4 * hw.vector_reg_bytes) * kFP8SRStepCycles;
+        cost += ceil_div(sr_cycles * 1000, hw.aic_clock_mhz);
+    }
+    return cost;
 }
 
 static int64_t get_gemm_refinement_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmConfig& c) {
@@ -711,10 +732,13 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
     }
 
     // Prefer native FP4 full MADs without reducing operand or epilogue buffers.
+    const bool with_fp8_sr = dynamic_cast<const FP8StochasticRoundingEpilogue*>(d.epilogue_class.get()) != nullptr;
+    const bool with_fp8_quant = dynamic_cast<const FP8QuantizationEpilogue*>(d.epilogue_class.get()) != nullptr;
     const uint64_t full_epilogue_bytes = uint64_t(config.block_m) * config.block_n * dtype.epilogue_elem_bits / 8 +
                                          (dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) ? config.block_n * c10::elementSize(d.cd_dtype) : 0) +
-                                         (with_fp8_cast ? uint64_t(config.block_m) * config.block_n / 32 : 0);
-    if (dtype.elem_bits == 4 && uint64_t(config.block_m) * config.mad_k * config.num_l0_stages * dtype.elem_bits <= L0ASizeBytes * 8 &&
+                                         (with_fp8_quant ? static_cast<uint64_t>(config.block_m) * config.block_n / 32 : 0);
+    if (dtype.elem_bits == 4 && (!with_fp8_sr || can_stochastic_round_fp8(hw, config.block_m, config.block_n)) &&
+        uint64_t(config.block_m) * config.mad_k * config.num_l0_stages * dtype.elem_bits <= L0ASizeBytes * 8 &&
         uint64_t(config.block_n) * config.mad_k * config.num_l0_stages * dtype.elem_bits <= L0BSizeBytes * 8 &&
         full_epilogue_bytes * config.num_epilogue_stages <= UBSizeBytes) {
         auto full = config;

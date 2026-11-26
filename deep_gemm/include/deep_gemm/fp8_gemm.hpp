@@ -73,7 +73,7 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
 
     const Epilogue<cd_dtype_t, epilogue_operator_t, kWithAccumulation,
                    BLOCK_M, BLOCK_N, MAD_M, MAD_N, kNumEpilogueStages, 2,
-                   kL2CtrlStoreCd> epilogue{epilogue_args};
+                   kL2CtrlStoreCd, kGemmType == GemmType::MGroupedContiguousWithPsumLayout> epilogue{epilogue_args};
     static_assert(!kDirectStore || std::is_same_v<typename decltype(epilogue)::operator_t,
                                                   epilogue::operators::Identity<typename decltype(epilogue)::params_t>>);
 
@@ -94,8 +94,8 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
     static_assert(MAD_K % 64 == 0, "ascend forces MAD_K to be a multiple of 64");
 
     uint32_t m_block_idx, n_block_idx;
-    Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumCores, kAlignment> scheduler(block_idx, kSingleMBlock ? BLOCK_M : shape_m, shape_n, grouped_layout,
-                                                                            num_groups);
+    Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumCores, kAlignment> scheduler(block_idx, kSingleMBlock ? BLOCK_M : shape_m, shape_n,
+                                                                            grouped_layout, num_groups);
 
     constexpr bool is_m_grouped = kGemmType == GemmType::MGroupedContiguousWithPsumLayout;
     constexpr bool is_k_grouped = kGemmType == GemmType::KGroupedContiguousWithPsumLayout;
@@ -125,8 +125,8 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
         const bool can_reuse_b = shape_n <= BLOCK_N && ceil_div(shape_m, BLOCK_M) > kNumCores;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            const uint32_t m_idx = scheduler.get_global_idx(BLOCK_M, m_block_idx);
-            const uint32_t n_idx = scheduler.get_global_idx(BLOCK_N, n_block_idx);
+            const uint32_t m_idx = scheduler.get_global_m_idx(m_block_idx);
+            const uint32_t n_idx = scheduler.get_global_n_idx(n_block_idx);
             const uint32_t eff_shape_k = is_k_grouped ? scheduler.current_shape_k : shape_k;
             const uint32_t num_k_blocks = ceil_div(eff_shape_k, BLOCK_K);
             const uint32_t k_idx_base = scheduler.get_k_idx_base();
@@ -258,6 +258,7 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
                     k_within_chunk = 0;
                 }
             }
+            if constexpr (is_m_grouped) epilogue.aic_insert_padding_stages(actual_m, actual_n, scheduler.get_num_padding_rows(m_block_idx), epi_stage_idx);
             epi_base_idx = epi_stage_idx;
             last_a = a.addr;
             last_b = b.addr;
@@ -272,8 +273,8 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
 
         uint32_t s_epi = 0;
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            const uint32_t m_idx = scheduler.get_global_idx(BLOCK_M, m_block_idx);
-            const uint32_t n_idx = scheduler.get_global_idx(BLOCK_N, n_block_idx);
+            const uint32_t m_idx = scheduler.get_global_m_idx(m_block_idx);
+            const uint32_t n_idx = scheduler.get_global_n_idx(n_block_idx);
             const uint32_t actual_m = kSingleMBlock ? shape_m : scheduler.get_actual_m(m_block_idx);
             const uint32_t actual_n = scheduler.get_actual_n(n_block_idx);
 
@@ -281,7 +282,7 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
             const auto d_group_idx = is_k_grouped ? scheduler.get_group_idx() : 0;
             const auto d = gm_d.batch(batch_idx).group(d_group_idx, shape_m, shape_n);
 
-            epilogue.aiv_drain(d, m_idx, n_idx, actual_m, actual_n, s_epi, batch_idx);
+            epilogue.aiv_drain(d, m_idx, n_idx, actual_m, actual_n, s_epi, is_batched ? batch_idx : d_group_idx, scheduler.get_num_padding_rows(m_block_idx));
         }
     }
 }

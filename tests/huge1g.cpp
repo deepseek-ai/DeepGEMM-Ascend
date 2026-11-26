@@ -21,7 +21,7 @@ static at::Tensor empty_huge1g(int64_t num_bytes, int device_idx) {
             c10_npu::device_synchronize();
             const auto status = aclrtFree(pointer);
             if (status != ACL_SUCCESS)
-                std::fprintf(stderr, "HUGE1G release failed: %d\n", static_cast<int>(status));
+                std::fprintf(stderr, "HUGE1G release failed: %d\n", status);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "HUGE1G cleanup failed: %s\n", error.what());
         } catch (...) {

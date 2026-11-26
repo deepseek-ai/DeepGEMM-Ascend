@@ -213,7 +213,7 @@ static std::optional<GemmDesc> get_gemm_desc(
 //         * **sfB**: [ceil(N / gran_n), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel
 //         will panic
-//     d: shape [M, N], bf16 or fp32.
+//     d: shape [M, N], bf16 or fp32, or FP8 with FP8Quantization(sfd) or FP8StochasticRounding(sfd).
 //     c: optional tensor with D's dtype; alias D with the same shape for accumulation, or pass a separate contiguous [1, N] bias.
 //     recipe: optional combined quantization granularity (gran_m, gran_n, gran_k);
 //         mutually exclusive with recipe_a / recipe_b.
@@ -238,7 +238,6 @@ static void fp8_fp4_gemm(
 ) {
     auto [a, sfa_in] = get_transposed<kTransA>(a_, 0, 1);
     auto [b, sfb_in] = get_transposed<kTransB>(b_, 0, 1);
-    DJ_HOST_ASSERT(d.scalar_type() == at::kBFloat16 or d.scalar_type() == at::kFloat);
     auto maybe_desc = get_gemm_desc(
         GemmType::Normal,
         a, b, d, c, resolve_epilogue_class(epilogue_class, c, d, alpha), sfa_in, sfb_in,
@@ -283,8 +282,7 @@ inline constexpr auto fp8_fp4_gemm_tt = fp8_fp4_gemm<true, false>;
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     disable_ue8m0_cast: when true, forbid casting float32 scale factors into ue8m0.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.
-//     ensure_zero_padding: when true, the output is zero-padded only if the input
-//         is zero-padded (the kernel itself also accepts non-zero padding).
+//     ensure_zero_padding: retained for compatibility; output padding is always zero.
 //     expected_m_for_psum_layout: optional expected per-group M used to size the layout.
 template <bool kTransA, bool kTransB>
 static void m_grouped_fp8_fp4_gemm_contiguous(
@@ -314,7 +312,7 @@ static void m_grouped_fp8_fp4_gemm_contiguous(
         recipe, recipe_a, recipe_b,
         grouped_layout, compiled_dims,
         disable_ue8m0_cast,
-        expected_m_for_psum_layout.value_or(0u)
+        expected_m_for_psum_layout
     );
     if (!maybe_desc.has_value()) return;
     dispatch_fp8_fp4_gemm(maybe_desc.value());
@@ -341,7 +339,7 @@ inline constexpr auto m_grouped_fp8_fp4_gemm_nn_contiguous = m_grouped_fp8_fp4_g
 //         * **sfB**: [ceil(N / gran_n), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel
 //         will panic
-//     d: shape [G, M, N], bf16 or fp32.
+//     d: shape [G, M, N], bf16 or fp32, or FP8 with FP8Quantization(sfd) or FP8StochasticRounding(sfd).
 //     ks_cpu: optional [G], int (on CPU). Per-group K sizes.
 //     grouped_layout: [G], int32. Per-group layout describing the contiguous K partition.
 //     c: optional [G, M, N] tensor with the same dtype as D; computes D = A @ B + C.
@@ -368,7 +366,6 @@ static void k_grouped_fp8_gemm_tn_contiguous(
     auto [g, m, n, k] = get_shape_by_spec<"gmnk">("mk"_sp = a, "nk"_sp = b, "gmn"_sp = d, "g"_sp = grouped_layout);
     DJ_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn or a.scalar_type() == kPackedFP4);
     DJ_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn or b.scalar_type() == kPackedFP4);
-    DJ_HOST_ASSERT(d.scalar_type() == at::kBFloat16 or d.scalar_type() == at::kFloat);
     DJ_HOST_ASSERT(use_psum_layout == true);
     auto expected_k = expected_k_from_ks(ks_cpu, k / g);
     auto maybe_desc = get_gemm_desc(
@@ -464,8 +461,7 @@ inline constexpr auto bf16_gemm_tt = bf16_gemm<true, false>;
 //     grouped_layout: [G], int32. Per-group row counts describing the contiguous partition of A.
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.
-//     ensure_zero_padding: when true, the output is zero-padded only if the input
-//         is zero-padded (the kernel itself also accepts non-zero padding).
+//     ensure_zero_padding: retained for compatibility; output padding is always zero.
 //     expected_m_for_psum_layout: optional expected per-group M used to size the layout.
 template <bool kTransB>
 static void m_grouped_bf16_gemm_contiguous(

@@ -30,7 +30,7 @@ namespace py = pybind11;
 //         * **B**: [B, N, K], fp8_e4m3
 //         * **sfB**: [B, ceil(N / gran_n), ceil(K / gran_k)], fp32 or short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0
-//     d: shape [B, M, N], bf16 or fp32, or FP8 with FP8Quantization(sfd) / a (D, SFD) pair.
+//     d: shape [B, M, N], bf16 or fp32, or FP8 with FP8Quantization(sfd), FP8StochasticRounding(sfd), or a (D, SFD) pair.
 //     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
 //     recipe: optional combined quantization granularity (gran_m, gran_n, gran_k).
 //     compiled_dims: which dimensions (e.g. "mn" or "nk") are baked in as compile-time constants for the kernel.
@@ -155,7 +155,7 @@ static void einsum(
 //         * **B**: fp8_e4m3, shape matches the second term of `expr`.
 //         * **sfB**: fp32 or short (packed ue8m0), in any major
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel will panic
-//     d: bf16/fp32, or FP8 with FP8Quantization(sfd); forward also accepts a (D, SFD) pair.
+//     d: bf16/fp32, or FP8 with FP8Quantization(sfd) or FP8StochasticRounding(sfd); forward also accepts a (D, SFD) pair.
 //     c: if present, the kernel computes C += einsum(expr, a, b), otherwise computes D = einsum(expr, a, b)
 //     recipe: combined quantization granularity (gran_m, gran_n, gran_k).
 static void fp8_einsum(

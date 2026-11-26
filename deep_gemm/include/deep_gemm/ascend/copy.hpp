@@ -20,82 +20,86 @@ __aicore__ inline void set_mte2_nz(
                           (static_cast<uint64_t>(dst_batch_stride_blocks) << 48));
 }
 
-template <typename dtype_t>
+template <uint32_t kNumBatch = 1, typename dtype_t>
 __aicore__ inline void copy_ub_to_gm(
     __gm__ dtype_t* dst_ptr, __ubuf__ dtype_t* src_ptr,
     uint64_t shape_m, uint64_t shape_n,
     uint64_t dst_stride_bytes,
-    asc_store_l2_cache_mode l2_ctrl = asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM
+    asc_store_l2_cache_mode l2_ctrl = asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
+    if constexpr (kNumBatch >= 2) {
+        asc_set_ub2gm_loop_size(kNumBatch, 1);
+        asc_set_ub2gm_loop1_stride(src_batch_stride_bytes, dst_batch_stride_bytes);
+    }
     asc_copy_ub2gm_align(dst_ptr, src_ptr,
                          /* burst_num */ shape_m,
                          /* burst_len */ shape_n * sizeof(dtype_t),
                          l2_ctrl,
                          /* burst_dst_stride */ dst_stride_bytes,
                          /* burst_src_stride */ shape_n * sizeof(dtype_t));
+    if constexpr (kNumBatch >= 2)
+        asc_set_ub2gm_loop_size(1, 1);
 }
 
-template <typename T>
+template <uint32_t kNumBatch = 1, typename T>
 __aicore__ inline void copy_gm_to_ub(
     ub_ptr<T> dst, __gm__ T* src,
     uint32_t n_rows, uint32_t n_cols_bytes,
     uint64_t src_stride_bytes, uint32_t dst_stride_bytes,
     asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
     uint8_t right_padding = 0,
-    bool enable_constant_pad = false
+    bool enable_constant_pad = false,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
+    if constexpr (kNumBatch >= 2) {
+        asc_set_gm2ub_loop_size(kNumBatch, 1);
+        asc_set_gm2ub_loop1_stride(src_batch_stride_bytes, dst_batch_stride_bytes);
+    }
     asc_copy_gm2ub_align(dst.ptr(), src, n_rows, n_cols_bytes, 0, right_padding, enable_constant_pad, l2_ctrl,
                          src_stride_bytes, dst_stride_bytes);
+    if constexpr (kNumBatch >= 2)
+        asc_set_gm2ub_loop_size(1, 1);
 }
 
-template <typename T, Major M>
+template <uint32_t kNumBatch = 1, typename T, Major M>
 __aicore__ inline void copy_gm_to_ub(
     ub_ptr<T> dst, gm_ptr<T, M> src,
     uint32_t valid_m, uint32_t valid_k,
     asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
-    bool enable_constant_pad = false
+    bool enable_constant_pad = false,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
     const uint32_t rows = M == Major::K ? valid_m : valid_k;
     const uint32_t cols = M == Major::K ? valid_k : valid_m;
     constexpr uint32_t kBlockElems = 32 / sizeof(T);
     const uint8_t right_padding = static_cast<uint8_t>((kBlockElems - cols % kBlockElems) % kBlockElems);
-    copy_gm_to_ub(dst, src.ptr(), rows, cols * sizeof(T), src.stride_outer * sizeof(T), dst.shape_n * sizeof(T),
-                  l2_ctrl, right_padding, enable_constant_pad);
+    copy_gm_to_ub<kNumBatch>(dst, src.ptr(), rows, cols * sizeof(T), src.stride_outer * sizeof(T), dst.shape_n * sizeof(T),
+                            l2_ctrl, right_padding, enable_constant_pad, dst_batch_stride_bytes, src_batch_stride_bytes);
 }
 
-template <typename dtype_t>
+template <uint32_t kNumBatch = 1, typename dtype_t>
 __aicore__ inline void copy_gm_to_ub(
     __ubuf__ dtype_t* dst_ptr, __gm__ dtype_t* src_ptr,
     uint64_t shape_m, uint64_t shape_n,
     uint64_t src_stride_bytes,
-    asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM
+    asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
-    asc_copy_gm2ub_align(dst_ptr, src_ptr,
-                         /* burst_num */ shape_m,
-                         /* burst_len */ shape_n * sizeof(dtype_t),
-                         /* left_padding */ 0,
-                         /* right_padding */ 0,
-                         /* data_select */ false,
-                         /* l2_cache_ctl */ l2_ctrl,
-                         /* burst_src_stride */ src_stride_bytes,
-                         /* burst_dst_stride */ shape_n * sizeof(dtype_t));
+    copy_gm_to_ub<kNumBatch>(ub_ptr<dtype_t>(shape_m, shape_n, reinterpret_cast<uintptr_t>(dst_ptr)), src_ptr,
+                            shape_m, shape_n * sizeof(dtype_t), src_stride_bytes, shape_n * sizeof(dtype_t),
+                            l2_ctrl, 0, false, dst_batch_stride_bytes, src_batch_stride_bytes);
 }
 
-template <typename T>
+template <uint32_t kNumBatch = 1, typename T>
 __aicore__ inline void copy_gm_to_ub(
     ub_ptr<T> dst, __gm__ T* src,
     uint64_t src_stride_bytes,
-    asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM
+    asc_load_l2_cache_mode l2_ctrl = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
-    asc_copy_gm2ub_align(dst.ptr(), src,
-                         /* burst_num */ dst.shape_m,
-                         /* burst_len */ dst.shape_n * sizeof(T),
-                         /* left_padding */ 0,
-                         /* right_padding */ 0,
-                         /* data_select */ false,
-                         /* l2_cache_ctl */ l2_ctrl,
-                         /* burst_src_stride */ src_stride_bytes,
-                         /* burst_dst_stride */ dst.shape_n * sizeof(T));
+    copy_gm_to_ub<kNumBatch>(dst, src, dst.shape_m, dst.shape_n * sizeof(T), src_stride_bytes, dst.shape_n * sizeof(T),
+                            l2_ctrl, 0, false, dst_batch_stride_bytes, src_batch_stride_bytes);
 }
 
 template <bool kSrcIsNZ = false, typename T, Major M>
@@ -275,7 +279,7 @@ __aicore__ inline void copy_l0c_to_ub(
     asc_unit_flag_mode unit_flag = asc_unit_flag_mode::ENABLE_UPDATE
 ) {
     if (transpose_out) {
-        set_l0c_nz2dn(src.shape_m * src.shape_n, static_cast<uint64_t>(n_elems) * dst.shape_n);
+        set_l0c_nz2dn(src.shape_m * src.shape_n, n_elems * dst.shape_n);
     } else {
         asc_set_l0c2gm_nz2nd(1, 0, 0);
     }
@@ -296,7 +300,7 @@ __aicore__ inline void copy_l0c_to_gm(
     asc_unit_flag_mode unit_flag = asc_unit_flag_mode::ENABLE_UPDATE
 ) {
     if (transpose_out) {
-        set_l0c_nz2dn(src.shape_m * src.shape_n, static_cast<uint64_t>(n_elems) * dst_stride_elems);
+        set_l0c_nz2dn(src.shape_m * src.shape_n, n_elems * dst_stride_elems);
     } else {
         asc_set_l0c2gm_nz2nd(1, 0, 0);
     }
@@ -305,15 +309,22 @@ __aicore__ inline void copy_l0c_to_gm(
                     false);
 }
 
-template <typename T>
+template <uint32_t kNumBatch = 1, typename T>
 __aicore__ inline void copy_ub_to_gm(
     __gm__ T* dst, ub_ptr<T> src,
     uint32_t n_rows, uint32_t n_cols,
     uint64_t dst_stride_bytes,
-    asc_store_l2_cache_mode l2_ctrl = asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM
+    asc_store_l2_cache_mode l2_ctrl = asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+    uint64_t dst_batch_stride_bytes = 0, uint64_t src_batch_stride_bytes = 0
 ) {
+    if constexpr (kNumBatch >= 2) {
+        asc_set_ub2gm_loop_size(kNumBatch, 1);
+        asc_set_ub2gm_loop1_stride(src_batch_stride_bytes, dst_batch_stride_bytes);
+    }
     asc_copy_ub2gm_align(dst, src.ptr(), n_rows, n_cols * sizeof(T), l2_ctrl, dst_stride_bytes,
                          src.shape_n * sizeof(T));
+    if constexpr (kNumBatch >= 2)
+        asc_set_ub2gm_loop_size(1, 1);
 }
 
 template <typename T>
@@ -372,10 +383,10 @@ __aicore__ inline void mad(l0c_ptr<TC> l0c, l0a_ptr<TA> l0a, l0b_ptr<TB> l0b,
                            uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                            asc_unit_flag_mode unit_flag, bool clear_C = false) {
     if constexpr (sizeof(TA) == 1 || sizeof(TB) == 1) {
-        asc_mmad_mx(l0c.ptr(), l0a.ptr(), l0b.ptr(), shape_m, shape_k, shape_n, static_cast<uint8_t>(unit_flag), true,
+        asc_mmad_mx(l0c.ptr(), l0a.ptr(), l0b.ptr(), shape_m, shape_k, shape_n, unit_flag, true,
                     false, clear_C);
     } else {
-        asc_mmad(l0c.ptr(), l0a.ptr(), l0b.ptr(), shape_m, shape_k, shape_n, static_cast<uint8_t>(unit_flag), true,
+        asc_mmad(l0c.ptr(), l0a.ptr(), l0b.ptr(), shape_m, shape_k, shape_n, unit_flag, true,
                  false, clear_C);
     }
 }

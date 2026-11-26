@@ -1,9 +1,13 @@
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <type_traits>
 
+#include <deep_gemm/common.hpp>
 #include <deep_jit/backend/ascend/backend.hpp>
 #include <deep_jit/utils/exception.hpp>
 
@@ -92,5 +96,19 @@ inline void init_jit(const std::string& version, const std::string& library_root
 }
 
 aclrtStream get_current_npu_stream();
+
+// Replicate compact kernel arguments across kNumArgCopies x kArgCopyStrideBytes slices to avoid 96-core cold-L2 contention.
+template <typename KernelPtr, typename Args>
+inline void launch_replicated(const KernelPtr& kernel,
+                              const deep_jit::ascend::LaunchOptions& options, const Args& args) {
+    static_assert(std::is_trivially_copyable_v<Args> and sizeof(Args) <= kArgCopyStrideBytes and
+                  alignof(Args) <= kArgCopyStrideBytes);
+    struct alignas(kArgCopyStrideBytes) Slot { uint8_t bytes[kArgCopyStrideBytes]; };
+    Slot slot{};
+    std::memcpy(slot.bytes, &args, sizeof(args));
+    std::array<Slot, kNumArgCopies> replicated;
+    replicated.fill(slot);
+    jit->launch(kernel, options, replicated);
+}
 
 } // namespace deep_gemm

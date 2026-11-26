@@ -268,8 +268,6 @@ static torch::Tensor fp8_fp4_mqa_logits(
         .num_cd_stages = 2u,
         .num_q_stages = 2u,
         .num_kv_stages = 4u,
-        .num_accum_stages = 2u,
-        .num_logits_stages = 3u,
         .launch_options = {.num_blocks = runtime->get_num_sms()},
     };
     DJ_HOST_ASSERT(weights.size(0) == num_q_tokens and weights.size(1) == num_heads and weights.stride(1) == 1);
@@ -319,12 +317,13 @@ static torch::Tensor get_paged_mqa_logits_metadata(
     DJ_HOST_ASSERT(indices.dim() == 1 and indices.size(0) == num_q_tokens and
                    indices.scalar_type() == torch::kInt and indices.is_contiguous());
 
-    const PagedMQALogitsConfig config = select_paged_mqa_logits_config(num_heads);
+    DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 64 and num_heads % 4 == 0);
+    // TODO: Revisit the fixed 512-token metadata split; it currently supports both N256 and N512 kernels.
+    constexpr uint32_t SPLIT_KV = 512;
     const uint32_t num_cores = runtime->get_num_sms();
     auto metadata = torch::empty({num_cores + 1, 2}, context_lens.options());
-    launch_paged_mqa_logits_metadata(num_q_tokens, config.split_kv,
-                                     config.mad_m / num_heads, num_cores, context_lens.data_ptr(),
-                                     indices.data_ptr(), metadata.data_ptr());
+    launch_paged_mqa_logits_metadata(num_q_tokens, SPLIT_KV, num_cores,
+                                    context_lens.data_ptr(), indices.data_ptr(), metadata.data_ptr());
     return metadata;
 }
 
@@ -373,7 +372,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(
         .head_dim = head_dim,
         .page_size = page_size,
     };
-    const PagedMQALogitsConfig config = select_paged_mqa_logits_config(num_heads);
+    const PagedMQALogitsConfig config = select_paged_mqa_logits_config(desc);
 
     DJ_HOST_ASSERT(q_data.size(1) == 1);
     DJ_HOST_ASSERT(q_data.scalar_type() == torch::kFloat8_e4m3fn or q_data.scalar_type() == kPackedFP4);

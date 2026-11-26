@@ -195,7 +195,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumMetadataThreads) inline void sparse
 ) {
     // Producers may have cached a neighbor's header before its final update.
     if (threadIdx.x == 0)
-        asc_dcci_entire(reinterpret_cast<__gm__ void*>(q_block_headers));
+        asc_dcci_entire(q_block_headers);
     asc_syncthreads();
     constexpr uint32_t kWarpSize = 32;
     constexpr uint32_t kNumWarps = kNumMetadataThreads / kWarpSize;
@@ -233,9 +233,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumMetadataThreads) inline void sparse
     const uint32_t num_items_per_thread = kNumScheduleCores == 1 ? 1 :
         min(ceil_div(q_token_end - q_token_begin, kNumMetadataThreads) | 1u, kNumPrefixItemsPerThread);
     uint32_t work_end = work_begin;
-    using index_t = std::conditional_t<kNumScheduleCores == 1, uint32_t, uint64_t>;
-    for (index_t query_begin = q_token_begin; query_begin < q_token_end; query_begin += kNumMetadataThreads * num_items_per_thread) {
-        const uint32_t num_items = min(static_cast<index_t>(kNumMetadataThreads * num_items_per_thread), q_token_end - query_begin);
+    for (uint32_t query_begin = q_token_begin; query_begin < q_token_end;) {
+        const uint32_t num_items = min(kNumMetadataThreads * num_items_per_thread, q_token_end - query_begin);
         const uint32_t item_begin_idx = min(threadIdx.x * num_items_per_thread, num_items);
         const uint32_t item_end_idx = min(item_begin_idx + num_items_per_thread, num_items);
         uint32_t thread_work = 0;
@@ -288,8 +287,9 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumMetadataThreads) inline void sparse
             schedule[schedule_idx].query_begin = query_begin + begin_idx;
             schedule[schedule_idx].kv_split_begin = work_offset > num_q_block_queries ? (work_offset - num_q_block_queries) / kv_split_work : 0;
         }
+        query_begin += num_items;
         if constexpr (kNumScheduleCores > 1)
-            if (query_begin + kNumMetadataThreads * num_items_per_thread < q_token_end)
+            if (query_begin < q_token_end)
                 asc_syncthreads();
     }
     if (core_idx == 0 && threadIdx.x <= kNumAICores) {
@@ -355,7 +355,7 @@ __global__ __mix__(0, 1) void sparse_mqa_logits_metadata(
             cce::dim3(kNumMetadataThreads), q_block_headers + query_begin,
             physical_kv_token_starts + static_cast<uint64_t>(query_begin) * capacity,
             kv_split_outputs + static_cast<uint64_t>(query_begin) * ((capacity + kBlocksPerSplitKV - 1) / kBlocksPerSplitKV),
-            capacity, row_stride, num_q_block_queries, reinterpret_cast<__ubuf__ volatile uint32_t*>(ub_workspace.ptr()));
+            capacity, row_stride, num_q_block_queries, ub_workspace.ptr());
         asc_sync_notify(PIPE_V, PIPE_MTE2, EVENT_ID0);
         asc_sync_wait(PIPE_V, PIPE_MTE2, EVENT_ID0);
     }
@@ -367,7 +367,7 @@ __global__ __mix__(0, 1) void sparse_mqa_logits_metadata(
     if (get_block_idx() < kNumScheduleCores)
         asc_vf_call<sparse_mqa_logits_schedule_vf<kSparseBlockKV, kNumAICores, kNumScheduleCores>>(
             cce::dim3(kNumMetadataThreads),
-            get_block_idx(), num_q_tokens, q_block_headers, schedule, reinterpret_cast<__ubuf__ volatile uint32_t*>(ub_workspace.ptr()));
+            get_block_idx(), num_q_tokens, q_block_headers, schedule, ub_workspace.ptr());
 }
 
 } // namespace deep_gemm::sparse_mqa_logits_metadata

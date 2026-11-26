@@ -22,8 +22,6 @@ struct MQALogitsConfig {
     uint32_t num_cd_stages;
     uint32_t num_q_stages;
     uint32_t num_kv_stages;
-    uint32_t num_accum_stages;
-    uint32_t num_logits_stages;
     deep_jit::ascend::LaunchOptions launch_options;
 };
 
@@ -44,8 +42,7 @@ static void __instantiate() {{
         {},
         {}, {},
         {}, {}, {},
-        {}, {}, {},
-        {},
+        {}, {},
         {}>);
 }}
 )",
@@ -57,8 +54,6 @@ static void __instantiate() {{
         config.num_cd_stages,
         config.num_q_stages,
         config.num_kv_stages,
-        config.num_accum_stages,
-        config.num_logits_stages,
         config.launch_options.num_blocks.value());
     if (runtime->get_dry_run()) {
         jit->compile_without_load("mqa_logits", code);
@@ -87,17 +82,16 @@ struct PagedMQALogitsDesc {
 
 using PagedMQALogitsConfig = MQALogitsConfig;
 
-static PagedMQALogitsConfig select_paged_mqa_logits_config(uint32_t num_heads) {
-    DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 64 and num_heads % 4 == 0);
-    const uint32_t mad_m = 64u / num_heads * num_heads;
+static PagedMQALogitsConfig select_paged_mqa_logits_config(const PagedMQALogitsDesc& desc) {
+    DJ_HOST_ASSERT(desc.num_heads >= 4 and desc.num_heads <= 64 and desc.num_heads % 4 == 0);
+    const bool use_fp8_m128n256 = !desc.is_fp4 and desc.num_heads == 32 and desc.head_dim == 128;
+    const uint32_t mad_m = 64u / desc.num_heads * desc.num_heads;
     return {
-        .split_kv = 512u,
-        .mad_m = mad_m,
+        .split_kv = use_fp8_m128n256 ? 256u : 512u,
+        .mad_m = use_fp8_m128n256 ? 128u : mad_m,
         .num_cd_stages = 2u,
         .num_q_stages = 2u,
         .num_kv_stages = 4u,
-        .num_accum_stages = 3u,
-        .num_logits_stages = 3u,
         .launch_options = {.num_blocks = runtime->get_num_sms()},
     };
 }
@@ -105,7 +99,7 @@ static PagedMQALogitsConfig select_paged_mqa_logits_config(uint32_t num_heads) {
 static void launch_paged_mqa_logits_metadata(
     const uint32_t& num_q_tokens,
     const uint32_t& split_kv,
-    const uint32_t& num_q_tokens_per_tile, const uint32_t& num_cores,
+    const uint32_t& num_cores,
     void* context_lens, void* indices,
     void* metadata
 ) {
@@ -115,11 +109,10 @@ static void launch_paged_mqa_logits_metadata(
 using namespace deep_gemm;
 static void __instantiate() {{
     auto p = reinterpret_cast<void*>(&paged_mqa_logits_metadata_simt_impl<
-        {}, {}, {}>);
+        {}, {}>);
 }}
 )",
         split_kv,
-        num_q_tokens_per_tile,
         num_cores);
     if (runtime->get_dry_run()) {
         jit->compile_without_load("paged_mqa_logits_metadata", code);
@@ -157,7 +150,7 @@ static void __instantiate() {{
     auto p = reinterpret_cast<void*>(&paged_mqa_logits_impl<
         {}, {}, {}, {},
         {}, {}, {},
-        {}, {}, {}, {},
+        {}, {},
         {}>);
 }}
 )",
@@ -170,8 +163,6 @@ static void __instantiate() {{
         config.num_cd_stages,
         config.num_q_stages,
         config.num_kv_stages,
-        config.num_accum_stages,
-        config.num_logits_stages,
         use_ascend_kv_layout ? "true" : "false");
     if (runtime->get_dry_run()) {
         jit->compile_without_load("paged_mqa_logits", code);
