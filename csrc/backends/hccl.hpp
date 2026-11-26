@@ -14,7 +14,9 @@
 #include <hccl/hccl_res.h>
 #include <hcomm/hcomm_res.h>
 
+#include <deep_gemm/common.hpp>
 #include <deep_jit/backend/ascend/driver.hpp>
+#include "urma.hpp"
 
 #define DG_HCCL_CHECK(cmd) \
 do { \
@@ -25,11 +27,12 @@ do { \
 
 namespace deep_gemm {
 
-// Leases one process-lifetime HCCL-registered segment and resolves every peer's UBMEM VA.
+// Leases one process-lifetime HCCL-registered segment and resolves every peer's UBMEM VA
 class HCCLSymmetricBuffer {
 public:
     void* buffer = nullptr;
     std::vector<uint64_t> peer_ptrs;
+    std::unique_ptr<UrmaChannels> urma;
 
 private:
     std::string group_name;
@@ -39,6 +42,7 @@ private:
     uint32_t num_ranks;
     uint64_t num_bytes;
     bool leased = false;
+    std::string memory_tag;
 
     struct Pool {
         std::mutex mutex;
@@ -46,6 +50,11 @@ private:
     };
 
 public:
+    void init_urma(uint32_t num_jetties) {
+        if (urma == nullptr)
+            urma = std::make_unique<UrmaChannels>(comm, buffer, num_bytes, rank_idx, num_ranks, num_jetties, memory_tag);
+    }
+
     static std::shared_ptr<HCCLSymmetricBuffer> acquire(
         const std::string& group_name,
         uint32_t rank_idx,
@@ -78,6 +87,8 @@ public:
             auto& pool = HCCLSymmetricBuffer::get_pool();
             std::lock_guard lock(pool.mutex);
             DJ_HOST_ASSERT(symmetric_buffer->leased);
+            // Release URMA queues with the lease; keep HCCL registrations and peer mappings
+            symmetric_buffer->urma.reset();
             symmetric_buffer->leased = false;
         });
     }
@@ -108,7 +119,7 @@ private:
 
         // NOTES: Ranks must match process-wide registration order, including subgroup allocations
         static std::atomic<uint32_t> next_tag_idx = 0;
-        const auto memory_tag = "deep_gemm_mega_moe_" + std::to_string(next_tag_idx.fetch_add(1));
+        memory_tag = "deep_gemm_mega_moe_" + std::to_string(next_tag_idx.fetch_add(1));
         DG_HCCL_CHECK(HcclCommMemReg(comm, memory_tag.c_str(), &memory, &memory_handle));
 
         peer_ptrs[rank_idx] = reinterpret_cast<uint64_t>(buffer);
@@ -164,7 +175,7 @@ private:
     }
 
     // HcclCommMemReg has no matching HCCL unregister API. Keep registered allocations alive
-    // for the process lifetime and reuse them; freeing one leaves stale remote mappings.
+    // for the process lifetime and reuse them; freeing one leaves stale remote mappings
     static Pool& get_pool() {
         static auto* pool = new Pool;
         return *pool;

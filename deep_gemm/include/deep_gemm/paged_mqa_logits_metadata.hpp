@@ -9,30 +9,10 @@ inline constexpr uint32_t kNumPagedMQAMetadataThreads = 256;
 inline constexpr uint32_t kPagedMQAWarpSize = 32;
 inline constexpr uint32_t kNumPagedMQAMetadataWarps = kNumPagedMQAMetadataThreads / kPagedMQAWarpSize;
 
-template <uint32_t kSplitKV, uint32_t kNumQTokensPerTile>
-__simt_callee__ __aicore__ inline uint32_t paged_mqa_split_cost(uint32_t num_q_tokens, uint32_t num_kv_tokens) {
-    const uint32_t num_q_tiles = ceil_div(num_q_tokens, kNumQTokensPerTile);
-    // Measured H8/H16/H32 model: fixed per-split cost plus per-tile cost; H64 uses the tile count.
-    const uint32_t cost = kNumQTokensPerTile > 1 ? 2 + 2 * num_q_tiles : num_q_tiles;
-    return ceil_div(num_kv_tokens, kSplitKV / 4) * cost + 2;
-}
-
-template <uint32_t kSplitKV, uint32_t kNumQTokensPerTile>
-__simt_callee__ __aicore__ inline uint32_t paged_mqa_request_cost(uint32_t q_token_start, uint32_t num_q_tokens,
-                                                                  __gm__ uint32_t* context_lens) {
-    const uint32_t context_len = mqa_request_context_len(q_token_start, num_q_tokens, context_lens);
-    const uint32_t num_kv_splits = ceil_div(context_len, kSplitKV);
-    if (num_kv_splits == 0)
-        return 0;
-    const uint32_t full_split_cost = paged_mqa_split_cost<kSplitKV, kNumQTokensPerTile>(num_q_tokens, kSplitKV);
-    const uint32_t last_tokens = context_len - (num_kv_splits - 1) * kSplitKV;
-    return (num_kv_splits - 1) * full_split_cost +
-           paged_mqa_split_cost<kSplitKV, kNumQTokensPerTile>(num_q_tokens, last_tokens);
-}
-
-__simt_callee__ __aicore__ inline uint32_t paged_mqa_thread_exclusive_sum(uint32_t value, uint32_t lane_idx,
-                                                                          uint32_t warp_idx,
-                                                                          __ubuf__ uint32_t* warp_sums) {
+__simt_callee__ __aicore__ inline uint32_t paged_mqa_thread_exclusive_sum(
+    uint32_t value, uint32_t lane_idx, uint32_t warp_idx,
+    __ubuf__ uint32_t* warp_sums
+) {
     const uint32_t lane_prefix = warp_prefix_sum(value, lane_idx);
     if (lane_idx == kPagedMQAWarpSize - 1)
         warp_sums[warp_idx] = lane_prefix;
@@ -50,29 +30,31 @@ __simt_callee__ __aicore__ inline uint32_t paged_mqa_thread_exclusive_sum(uint32
     return warp_offset + (lane_idx == 0 ? 0 : asc_shfl_up(lane_prefix, 1));
 }
 
-__simt_callee__ __aicore__ inline void paged_mqa_prefix_scan(uint32_t num_items, __ubuf__ uint32_t* prefix,
-                                                             __ubuf__ uint32_t* warp_sums) {
+__simt_callee__ __aicore__ inline void paged_mqa_prefix_scan(
+    uint32_t num_items, __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* warp_sums
+) {
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t lane_idx = thread_idx % kPagedMQAWarpSize;
     const uint32_t warp_idx = thread_idx / kPagedMQAWarpSize;
+
     // Keep adjacent threads' chunks on different UB banks by using an odd lane stride.
     const uint32_t num_items_per_thread = ceil_div(num_items, kNumPagedMQAMetadataThreads) | 1u;
     const uint32_t item_begin_idx = min(thread_idx * num_items_per_thread, num_items);
     const uint32_t item_end_idx = min(item_begin_idx + num_items_per_thread, num_items);
 
     uint32_t thread_sum = 0;
-    for (uint32_t item_idx = item_begin_idx; item_idx < item_end_idx; ++item_idx) {
+    for (uint32_t item_idx = item_begin_idx; item_idx < item_end_idx; ++ item_idx) {
         thread_sum += prefix[item_idx];
         prefix[item_idx] = thread_sum;
     }
 
     const uint32_t thread_offset = paged_mqa_thread_exclusive_sum(thread_sum, lane_idx, warp_idx, warp_sums);
-    for (uint32_t item_idx = item_begin_idx; item_idx < item_end_idx; ++item_idx)
+    for (uint32_t item_idx = item_begin_idx; item_idx < item_end_idx; ++ item_idx)
         prefix[item_idx] += thread_offset;
     asc_syncthreads();
 }
 
-template <uint32_t kSplitKV, uint32_t kNumQTokensPerTile, uint32_t kNumCores>
+template <uint32_t SPLIT_KV, uint32_t kNumCores>
 __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline void paged_mqa_logits_metadata_vf(
     uint32_t num_q_tokens,
     __gm__ uint32_t* context_lens, __gm__ uint32_t* indices,
@@ -80,6 +62,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
     __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* request_starts,
     __ubuf__ uint32_t* warp_sums
 ) {
+    static_assert(SPLIT_KV > 0 && SPLIT_KV % 16 == 0);
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t lane_idx = thread_idx % kPagedMQAWarpSize;
     const uint32_t warp_idx = thread_idx / kPagedMQAWarpSize;
@@ -93,14 +76,14 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
     const uint32_t q_token_begin_idx = min(thread_idx * num_q_tokens_per_thread, num_q_tokens);
     const uint32_t q_token_end_idx = min(q_token_begin_idx + num_q_tokens_per_thread, num_q_tokens);
     uint32_t num_request_starts = 0;
-    for (uint32_t q_token_idx = q_token_begin_idx; q_token_idx < q_token_end_idx; ++q_token_idx) {
+    for (uint32_t q_token_idx = q_token_begin_idx; q_token_idx < q_token_end_idx; ++ q_token_idx) {
         const bool is_request_start = q_token_idx == 0 || indices[q_token_idx] != indices[q_token_idx - 1];
         prefix[q_token_idx] = is_request_start;
         num_request_starts += is_request_start;
     }
     uint32_t request_idx = paged_mqa_thread_exclusive_sum(num_request_starts, lane_idx, warp_idx, warp_sums);
     const uint32_t num_requests = warp_sums[kNumPagedMQAMetadataWarps - 1];
-    for (uint32_t q_token_idx = q_token_begin_idx; q_token_idx < q_token_end_idx; ++q_token_idx) {
+    for (uint32_t q_token_idx = q_token_begin_idx; q_token_idx < q_token_end_idx; ++ q_token_idx) {
         if (prefix[q_token_idx])
             request_starts[request_idx++] = q_token_idx;
     }
@@ -109,8 +92,10 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
         const uint32_t q_token_start = request_starts[request_idx];
         const uint32_t q_token_end = request_idx + 1 < num_requests ? request_starts[request_idx + 1] : num_q_tokens;
         const uint32_t num_q_tokens_in_request = q_token_end - q_token_start;
-        prefix[request_idx] =
-            paged_mqa_request_cost<kSplitKV, kNumQTokensPerTile>(q_token_start, num_q_tokens_in_request, context_lens);
+        const uint32_t context_len = mqa_request_context_len(q_token_start, num_q_tokens_in_request, context_lens);
+
+        // Bound short requests by KV transfer cost and scale larger requests by FIX output rows.
+        prefix[request_idx] = ceil_div(context_len, 16u) * max(num_q_tokens_in_request, 3u);
     }
     asc_syncthreads();
     if (num_requests == 0)
@@ -135,18 +120,21 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumPagedMQAMetadataThreads) inline voi
         const uint32_t num_q_tokens_in_request = q_token_end - q_token_start;
         const uint32_t previous_cost = request_idx == 0 ? 0 : prefix[request_idx - 1];
         const uint32_t context_len = mqa_request_context_len(q_token_start, num_q_tokens_in_request, context_lens);
-        const uint32_t full_split_cost = paged_mqa_split_cost<kSplitKV, kNumQTokensPerTile>(num_q_tokens_in_request, kSplitKV);
+        const uint32_t split_cost = (SPLIT_KV / 16) * max(num_q_tokens_in_request, 3u);
+
+        // Each boundary is (request Q token index, KV token offset).
         metadata_ub[metadata_idx] = q_token_start;
-        metadata_ub[metadata_idx + 1] = min((target_cost - previous_cost) / full_split_cost,
-                                            ceil_div(context_len, kSplitKV) - 1);
+        metadata_ub[metadata_idx + 1] = min((target_cost - previous_cost) / split_cost,
+                                            ceil_div(context_len, SPLIT_KV) - 1) * SPLIT_KV;
     }
     asc_syncthreads();
 }
 
-template <uint32_t kSplitKV, uint32_t kNumQTokensPerTile, uint32_t kNumCores>
+template <uint32_t SPLIT_KV, uint32_t kNumCores>
 __global__ __vector__ void paged_mqa_logits_metadata_simt_impl(
     uint32_t num_q_tokens, __gm__ uint32_t* context_lens,
-    __gm__ uint32_t* indices, __gm__ uint32_t* metadata) {
+    __gm__ uint32_t* indices, __gm__ uint32_t* metadata
+) {
     static_assert(kNumCores > 0 && kNumCores < kNumPagedMQAMetadataThreads);
     if (block_idx != 0)
         return;
@@ -158,7 +146,7 @@ __global__ __vector__ void paged_mqa_logits_metadata_simt_impl(
     const uint32_t metadata_offset_bytes = aligned(request_arrays_bytes + kNumPagedMQAMetadataWarps * sizeof(uint32_t), 32u);
     auto metadata_ub = reinterpret_cast<__ubuf__ uint32_t*>(metadata_offset_bytes);
     asc_sync_pipe(PIPE_ALL);
-    asc_vf_call<paged_mqa_logits_metadata_vf<kSplitKV, kNumQTokensPerTile, kNumCores>>(
+    asc_vf_call<paged_mqa_logits_metadata_vf<SPLIT_KV, kNumCores>>(
         cce::dim3(kNumPagedMQAMetadataThreads), num_q_tokens, context_lens, indices, metadata_ub, prefix,
         request_starts, warp_sums);
     asc_sync_pipe(PIPE_ALL);

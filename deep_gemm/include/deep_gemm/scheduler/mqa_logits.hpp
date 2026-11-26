@@ -4,7 +4,7 @@
 
 namespace deep_gemm {
 
-template <uint32_t kNumQTokensPerBlock, uint32_t kSplitKV, uint32_t kNumCores>
+template <uint32_t kNumQTokensPerBlock, uint32_t SPLIT_KV, uint32_t kNumCores>
 struct MQALogitsScheduler {
     uint32_t current_q_block_idx;
     uint32_t num_q_blocks;
@@ -32,6 +32,7 @@ struct MQALogitsScheduler {
         if (current_q_block_idx >= num_q_blocks)
             return false;
 
+        // TODO: Consider metadata-based partitioning by issued MAD/FIX work for uneven CP KV ranges.
         q_block_idx = current_q_block_idx;
         current_q_block_idx += kNumCores;
 
@@ -47,7 +48,7 @@ struct MQALogitsScheduler {
         }
         block_kv_end = end;
         kv_token_base = start / 8 * 8;
-        num_kv_splits = ceil_div(end - kv_token_base, kSplitKV);
+        num_kv_splits = ceil_div(end - kv_token_base, SPLIT_KV);
         return true;
     }
 
@@ -57,16 +58,23 @@ struct MQALogitsScheduler {
     __aicore__ uint32_t get_num_q_tokens_in_block(uint32_t q_block_idx) const {
         return min(kNumQTokensPerBlock, num_q_tokens - get_q_base(q_block_idx));
     }
+    // KV token bounds use global query indices.
+    __aicore__ uint32_t get_kv_token_begin(uint32_t q_idx) const {
+        return cu_seq_len_k_start[q_idx];
+    }
+    __aicore__ uint32_t get_kv_token_end(uint32_t q_idx) const {
+        return cu_seq_len_k_end[q_idx];
+    }
     // NOTES: SF strides are in int16_t elements, not bytes.
     __aicore__ uint32_t get_q_sf_stride() const {
         return num_q_tokens * num_heads;
     }
     __aicore__ uint32_t get_kv_token_offset(uint32_t kv_token_base, uint32_t split_idx) const {
-        return kv_token_base + split_idx * kSplitKV;
+        return kv_token_base + split_idx * SPLIT_KV;
     }
     __aicore__ uint32_t get_num_kv_block_tokens(uint32_t kv_token_base, uint32_t split_idx) const {
         const uint32_t offset = get_kv_token_offset(kv_token_base, split_idx);
-        return offset < block_kv_end ? min(kSplitKV, block_kv_end - offset) : 0;
+        return offset < block_kv_end ? min(SPLIT_KV, block_kv_end - offset) : 0;
     }
     __aicore__ uint32_t get_kv_sf_stride() const {
         return num_kv_tokens;

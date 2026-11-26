@@ -29,7 +29,7 @@ link_directories(
 )
 
 pybind11_add_module(_C csrc/python_api.cpp)
-target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python ascendcl hccl_fwk torch_npu opapi dl)
+target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python ascendcl hccl_fwk hccl hcomm torch_npu opapi dl)
 target_link_options(_C PRIVATE "-Wl,-Bsymbolic-functions")
 
 # CLion cannot discover device sources that are only included by generated JIT code.

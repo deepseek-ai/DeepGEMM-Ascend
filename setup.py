@@ -50,7 +50,7 @@ build_include_dirs = [
     os.path.join(current_dir, 'third-party/deep-jit/include'),
     os.path.join(current_dir, 'third-party/magic_enum/include'),
 ]
-build_libraries = ['ascendcl', 'hccl_fwk', 'torch_npu', 'opapi', 'dl']
+build_libraries = ['ascendcl', 'hccl_fwk', 'hccl', 'hcomm', 'torch_npu', 'opapi', 'dl']
 build_library_dirs = [
     f'{ASCEND_HOME}/lib64',
     f'{TORCH_NPU_DIR}/lib',

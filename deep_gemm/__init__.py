@@ -1,4 +1,4 @@
-__version__ = '0.1.1'
+__version__ = '0.1.6'
 
 import os
 import torch
@@ -61,6 +61,7 @@ from ._C import (
     aclnn_bf16_gemm_nt, aclnn_bf16_gemm_nn,
     aclnn_bf16_gemm_tn, aclnn_bf16_gemm_tt,
     # BF16 GEMMs
+    batched_syrk, batched_symm,
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
@@ -69,12 +70,16 @@ from ._C import (
     # Einsum kernels
     einsum,
     fp8_einsum,
+    # Mega mHC
+    mega_mhc,
     # Attention kernels
     fp8_fp4_mqa_logits,
     get_paged_mqa_logits_metadata,
     fp8_fp4_paged_mqa_logits,
     get_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
+    # Mega kernels
+    bf16_mega_gate,
     # Layout kernels
     transform_sf_into_required_layout,
     transform_k_grouped_sf_into_required_layout,
@@ -139,6 +144,9 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
 )
+
+# Experimental kernels
+from ._C import experimental
 
 # Epilogue classes
 from ._C import epilogue

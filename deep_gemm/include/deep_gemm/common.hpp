@@ -25,6 +25,13 @@
 #define __gm__
 #endif
 
+#if defined(__CCE__) || defined(__CLION_IDE__)
+#define DG_DEVICE_CODE 1
+#define DG_GM_PTR(T) __gm__ T*
+#else
+#define DG_GM_PTR(T) void*
+#endif
+
 // Keep both mixed-kernel paths visible to the host indexer.
 #ifdef __CLION_IDE__
 #define DG_IS_AIC constexpr (true)
@@ -42,6 +49,16 @@ __aicore__ constexpr auto ceil_div(T1 a, T2 b) -> decltype(a + b) { return (a + 
 
 template <typename T1, typename T2>
 __aicore__ constexpr auto align(T1 a, T2 b) -> decltype(a + b) { return (a + b - 1) / b * b; }
+
+namespace simt {
+
+template <typename T1, typename T2>
+__simt_callee__ __aicore__ constexpr auto ceil_div(T1 a, T2 b) -> decltype(a + b) { return (a + b - 1) / b; }
+
+template <typename T1, typename T2>
+__simt_callee__ __aicore__ constexpr auto align(T1 a, T2 b) -> decltype(a + b) { return simt::ceil_div(a, b) * b; }
+
+} // namespace simt
 #endif
 
 template <typename T1, typename T2>
@@ -50,15 +67,22 @@ __aicore__ constexpr auto aligned(T1 a, T2 b) -> decltype(a + b) { return (a + b
 // Ascend 950DT core topology
 inline constexpr uint32_t kNumAICores = 32;
 inline constexpr uint32_t kNumAIVs = 2 * kNumAICores;
+inline constexpr uint32_t kNumLocalityDomains = 2;
+inline constexpr uint32_t kNumAICoresPerDomain = kNumAICores / kNumLocalityDomains;
 
 inline constexpr uint32_t L1SizeBytes = 512 * 1024;   // L1 per core
 inline constexpr uint32_t L0ASizeBytes = 64 * 1024;   // L0A
 inline constexpr uint32_t L0BSizeBytes = 64 * 1024;   // L0B
 inline constexpr uint32_t L0CSizeBytes = 256 * 1024;  // L0C (fp32 accumulator)
 inline constexpr uint32_t UBSizeBytes = 256 * 1024;   // UB
+inline constexpr uint64_t L2CacheSizeBytes = 128ull * 1024 * 1024;  // L2 cache
+inline constexpr uint32_t kDataBlockBytes = 32;
 inline constexpr uint32_t kDCacheLineBytes = 64;
 inline constexpr uint32_t kL2SectorBytes = 128;
+inline constexpr uint32_t kNumArgCopies = 8;
+inline constexpr uint32_t kArgCopyStrideBytes = 512;
 inline constexpr uint32_t kNumPipeEvents = 8;
+inline constexpr uint32_t kNumBufMutexes = 32;
 
 inline constexpr uint32_t FRAC_MN = 16;      // NZ fractal M/N rows
 inline constexpr uint32_t MX_ADDR_DIV = 16;  // MX dst address encoding divisor

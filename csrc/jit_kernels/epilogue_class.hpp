@@ -75,15 +75,11 @@ public:
     }
 };
 
-class FP8QuantizationEpilogue final : public EpilogueClass {
+class CastToFP8Epilogue : public EpilogueClass {
     torch::Tensor sfd;
 
 public:
-    explicit FP8QuantizationEpilogue(const torch::Tensor& sfd) : sfd(sfd) {}
-
-    std::string get_epilogue_operator_type() const override {
-        return "epilogue::operators::QuantizeToFP8";
-    }
+    explicit CastToFP8Epilogue(const torch::Tensor& sfd) : sfd(sfd) {}
 
     epilogue::Args make_epilogue_operator_args(const uint32_t& n) const override {
         return {.sfd = reinterpret_cast<uintptr_t>(sfd.data_ptr()),
@@ -94,15 +90,33 @@ public:
 
     void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
         DJ_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kFloat8_e4m3fn,
-                       "FP8 quantization requires a direct E4M3 output");
+                       "FP8 output requires a direct E4M3 output");
         DJ_HOST_ASSERT(d.dim() == 2 or d.dim() == 3);
         const auto m = d.size(-2), n = d.size(-1);
         const auto num_batches = d.dim() == 3 ? d.size(0) : 1;
         DJ_HOST_ASSERT(n % (2 * MX_SF_DIVISOR) == 0, "FP8 output requires N to be a multiple of 128");
-        DJ_HOST_ASSERT(d.stride(-1) == 1 and (d.dim() == 2 or d.stride(0) == n));
+        DJ_HOST_ASSERT(d.stride(-1) == 1 and (d.dim() == 2 or d.is_contiguous() or d.stride(0) == n));
         DJ_HOST_ASSERT(sfd.scalar_type() == torch::kShort and sfd.dim() == 2 and sfd.device() == d.device());
         DJ_HOST_ASSERT(sfd.size(0) == m and sfd.size(1) == num_batches * n / MX_SF_DIVISOR);
         DJ_HOST_ASSERT((sfd.stride(0) == 1 or m == 1) and sfd.stride(1) == m);
+    }
+};
+
+class FP8QuantizationEpilogue final : public CastToFP8Epilogue {
+public:
+    using CastToFP8Epilogue::CastToFP8Epilogue;
+
+    std::string get_epilogue_operator_type() const override {
+        return "epilogue::operators::QuantizeToFP8";
+    }
+};
+
+class FP8StochasticRoundingEpilogue final : public CastToFP8Epilogue {
+public:
+    using CastToFP8Epilogue::CastToFP8Epilogue;
+
+    std::string get_epilogue_operator_type() const override {
+        return "epilogue::operators::StochasticRoundToFP8";
     }
 };
 

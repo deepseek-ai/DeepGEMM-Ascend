@@ -7,7 +7,7 @@ import deep_gemm
 from deep_gemm.testing.bench import bench_msprof
 from deep_gemm.testing.par_compile import par_compile
 from generators import enumerate_einsum, generate_einsum, quantize_with_major
-from utils import assert_stochastic_bf16_matches_fp32, calc_diff, count_bytes
+from utils import assert_stochastic_bf16_matches_fp32, assert_stochastic_fp8_matches_fp32, calc_diff, count_bytes
 
 _EXPR_ROLE = {
     'bhr,hdr->bhd': 'forward',
@@ -56,6 +56,10 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
                 collect.append(partial(launch_direct, torch.empty_like(D, device='meta', dtype=torch.bfloat16),
                                        epilogue=deep_gemm.epilogue.BF16StochasticRounding()))
                 collect.append(partial(launch_direct, torch.empty_like(D, device='meta', dtype=torch.float32)))
+                if is_fp8 and role == 'wgrad' and r % 128 == 0:
+                    meta_out = torch.empty_like(D, device='meta', dtype=torch.float8_e4m3fn)
+                    meta_sfd = torch.empty_strided((d, h * r // 64), (1, d), device='meta', dtype=torch.int16)
+                    collect.append(partial(launch_direct, meta_out, epilogue=deep_gemm.epilogue.FP8StochasticRounding(meta_sfd)))
             return
 
         run()
@@ -91,6 +95,12 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
             output = torch.empty_like(D, dtype=torch.bfloat16)
             launch_direct(output, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
             assert_stochastic_bf16_matches_fp32(output, launch_direct, f'{expr}, {b=}, {h=}, {r=}, {d=}')
+            if is_fp8 and role == 'wgrad' and r % 128 == 0:
+                fp8_output = torch.empty_like(D, dtype=torch.float8_e4m3fn)
+                sfd = torch.empty_strided((d, h * r // 64), (1, d), device='npu', dtype=torch.int16)
+                launch_direct(fp8_output, epilogue=deep_gemm.epilogue.FP8StochasticRounding(sfd))
+                assert_stochastic_fp8_matches_fp32(
+                    fp8_output, sfd, launch_direct, f'FP8 stochastic rounding ({role}), {b=}, {h=}, {r=}, {d=}')
 
         flops = 2.0 * b * h * r * d
         prof = None
@@ -112,6 +122,8 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
             for b, h, r, d in ((4, 8, 128, 128), (13, 8, 512, 256), (4096, 2, 128, 128),
                                (1, 3, 128, 128), (13, 3, 128, 384), (257, 2, 128, 128)):
                 run_case('bhr,hdr->bhd', b, h, r, d, collect=collect)
+            for b, h, r, d in ((128, 16, 512, 128), (128, 16, 512, 64), (128, 3, 128, 65)):
+                run_case('bhd,bhr->hdr', b, h, r, d, collect=collect)
 
     kernels = []
     run_all(collect=kernels)

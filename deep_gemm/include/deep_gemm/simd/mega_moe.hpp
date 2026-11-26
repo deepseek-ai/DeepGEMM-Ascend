@@ -7,16 +7,12 @@
 
 namespace deep_gemm::mega_moe {
 
-// FP4 -> FP8 NZ, scaled by 2^-6; weight SFs compensate with +6
-// Rows map to GEMM N; columns map to K
-template <uint32_t kNumRows, uint32_t kNumCols>
-__simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t* dst) {
-    constexpr uint32_t kNumPackedCols = kNumCols / 2;
-    constexpr uint32_t kNumPaddedRows = kNumRows + 1;
-    constexpr uint32_t kNumPackedColsPerVector = sizeof(vector_int8_t) / 2;  // Two FP4 values per byte
-    constexpr uint32_t kNumVectorsPerRow = kNumPackedCols / kNumPackedColsPerVector;
-    static_assert(kNumPackedCols % kNumPackedColsPerVector == 0);
-
+// Expand FP4 to FP8 divided by 64, preserving element order; weight SFs compensate with +6
+template <uint32_t kNumElements>
+__simd_vf__ inline void vf_cast_fp4_to_fp8_scaled(__ubuf__ uint8_t* src, __ubuf__ uint8_t* dst) {
+    constexpr uint32_t kNumPackedBytesPerVector = sizeof(vector_int8_t) / 2;
+    constexpr uint32_t kNumVectors = 8;
+    static_assert(kNumElements / 2 % (kNumVectors * kNumPackedBytesPerVector) == 0);
     const auto mask = asc_create_mask_b8(PAT_ALL);
     vector_int8_t shift_right, shift_left, fp8_mask;
     asc_duplicate_scalar(shift_right, static_cast<int8_t>(2));
@@ -24,33 +20,18 @@ __simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t
     asc_duplicate_scalar(fp8_mask, static_cast<int8_t>(0x9c));  // Sign and shifted FP4 payload
 
     auto src_ptr = reinterpret_cast<__ubuf__ int8_t*>(src);
-    constexpr uint32_t kNumRowsPerPass = 4;
-    static_assert(kNumRows % kNumRowsPerPass == 0);
-    constexpr uint32_t kNumVectors = kNumVectorsPerRow * kNumRowsPerPass;
+    auto dst_ptr = dst;
 
-    // Each vector writes one row fragment in NZ order; the extra row pads the stride
-    __ubuf__ uint8_t* dst_ptrs[kNumVectors];
-    #pragma unroll
-    for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx)
-        dst_ptrs[vector_idx] = dst + vector_idx % kNumVectorsPerRow * kNumPaddedRows * 2 * kNumPackedColsPerVector +
-                               vector_idx / kNumVectorsPerRow * get_frac_k<uint8_t>();
-
-    for (uint32_t row_idx = 0; row_idx < kNumRows; row_idx += kNumRowsPerPass) {
-        // Expand packed nibbles into scaled FP8 values
-        vector_int8_t values[kNumVectors];
+    for (uint32_t packed_byte_idx = 0; packed_byte_idx < kNumElements / 2; packed_byte_idx += kNumVectors * kNumPackedBytesPerVector) {
         #pragma unroll
         for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx) {
-            asc_loadalign_upsample_postupdate(values[vector_idx], src_ptr, kNumPackedColsPerVector);
-            asc_shiftleft(values[vector_idx], values[vector_idx], shift_left, mask);
-            asc_shiftright(values[vector_idx], values[vector_idx], shift_right, mask);
-            asc_and(values[vector_idx], values[vector_idx], fp8_mask, mask);
+            vector_int8_t value;
+            asc_loadalign_upsample_postupdate(value, src_ptr, kNumPackedBytesPerVector);
+            asc_shiftleft(value, value, shift_left, mask);
+            asc_shiftright(value, value, shift_right, mask);
+            asc_and(value, value, fp8_mask, mask);
+            asc_storealign_postupdate(dst_ptr, reinterpret_cast<vector_uint8_t&>(value), sizeof(vector_uint8_t), mask);
         }
-
-        // Scatter into padded NZ and advance by four rows
-        #pragma unroll
-        for (uint32_t vector_idx = 0; vector_idx < kNumVectors; ++ vector_idx)
-            asc_storealign_postupdate(dst_ptrs[vector_idx], reinterpret_cast<vector_uint8_t&>(values[vector_idx]),
-                                      kNumPaddedRows, kNumRowsPerPass, mask);
     }
 }
 
@@ -66,6 +47,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
 
     const vector_bool group_mask_b32 = asc_create_mask_b32(PAT_VL32);
     const vector_bool pair_mask_b32 = asc_create_mask_b32(PAT_VL64);
+    const auto high_group_mask_b32 = asc_not(group_mask_b32, pair_mask_b32);
     vector_bfloat16_t zero_bf16;
     asc_duplicate_scalar(zero_bf16, 0);
     vector_int32_t arange_b32;
@@ -128,14 +110,12 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             const uint32_t sf_pair_idx = pair_idx % kNumPairsPerRow;
             vector_uint32_t bits[2];
             asc_abs(reinterpret_cast<vector_float&>(bits[0]), value[pair_idx], pair_mask_b32);
-            asc_gather(bits[1], bits[0], high_group_idx);
-            #pragma unroll
-            for (uint32_t group_idx = 0; group_idx < 2; ++ group_idx) {
-                asc_reduce_max(bits[group_idx], bits[group_idx], group_mask_b32);
-                asc_duplicate(bits[group_idx], bits[group_idx], pair_mask_b32);
-            }
+            asc_reduce_max(bits[1], bits[0], high_group_mask_b32);
+            asc_reduce_max(bits[0], bits[0], group_mask_b32);
+            asc_duplicate(bits[0], bits[0], pair_mask_b32);
+            asc_duplicate(bits[1], bits[1], pair_mask_b32);
 
-            // Round amax / 448 up to a power of two
+            // Round max(amax, 1e-4) / 448 up to a power of two
             asc_select(bits[0], bits[0], bits[1], group_mask_b32);
             asc_max_scalar(bits[0], bits[0], 0x38d1b717u, pair_mask_b32);  // FP32 bits of 1e-4
             asc_add_scalar(bits[0], bits[0], 0x001fffffu, pair_mask_b32);  // Carry when significand > 1.75
@@ -154,6 +134,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
                                         reinterpret_cast<vector_uint32_t&>(value_fp8), pair_mask_b32);
             output_ptr += MX_SF_DIVISOR;
 
+            // Pack both group scales into int16 entries indexed by SF pair and row
             asc_shiftright_scalar(bits[0], bits[0], 23, pair_mask_b32);
             asc_gather(bits[1], bits[0], high_group_idx);
             vector_uint8_t packed_sf_half, unused_sf_half;
@@ -165,14 +146,35 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
     }
 }
 
-// Combine: FP32 sum -> BF16; input stride is num_channels
-__simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t num_inputs, uint32_t num_channels) {
+template <typename rmsnorm_type>
+__simd_callee__ inline void load_as_float(vector_float& value, __ubuf__ rmsnorm_type* ptr) {
+    static_assert(std::is_same_v<rmsnorm_type, float> or std::is_same_v<rmsnorm_type, bfloat16_t>);
+    if constexpr (std::is_same_v<rmsnorm_type, float>)
+        asc_loadalign(value, ptr);
+    else {
+        asc_loadalign_unpack(reinterpret_cast<vector_bfloat16_t&>(value), ptr);
+        asc_bfloat162float(value, reinterpret_cast<vector_bfloat16_t&>(value), asc_create_mask_b16(PAT_ALL), ASC_POSITION_EVEN);
+    }
+}
+
+// Combine BF16 inputs in their fixed route order; input stride is num_channels
+template <bool kRMSNorm, typename rmsnorm_type>
+__simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, __ubuf__ rmsnorm_type* output,
+                                          uint32_t num_inputs, uint32_t num_channels, __ubuf__ float* row_square_sum, bool is_first_chunk) {
     constexpr uint32_t kNumChannelsPerVector = sizeof(vector_bfloat16_t) / sizeof(bfloat16_t);
     const auto mask_b16 = asc_create_mask_b16(PAT_ALL);
     const auto mask_b32 = asc_create_mask_b32(PAT_ALL);
     vector_bfloat16_t zero_bf16;
     asc_duplicate_scalar(zero_bf16, 0);
-    auto output_ptr = inputs;
+    auto output_ptr = output;
+
+    vector_float square_sum;
+    if constexpr (kRMSNorm) {
+        if (is_first_chunk)
+            asc_duplicate_scalar(square_sum, 0.0f);
+        else
+            asc_loadalign(square_sum, row_square_sum);
+    }
 
     for (uint32_t channel_idx = 0; channel_idx < num_channels; channel_idx += kNumChannelsPerVector) {
         vector_float sum0, sum1;
@@ -190,12 +192,63 @@ __simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t 
             asc_add(sum1, sum1, value1, mask_b32);
         }
 
-        // Round to BF16 and pack both halves
-        vector_bfloat16_t output0, output1, output, unused;
-        asc_float2bfloat16_rn(output0, sum0, mask_b32, ASC_POSITION_EVEN);
-        asc_float2bfloat16_rn(output1, sum1, mask_b32, ASC_POSITION_EVEN);
-        asc_deintlv(output, unused, output0, output1);
-        asc_storealign_postupdate(output_ptr, output, kNumChannelsPerVector, mask_b16);
+        // Store output; RMS uses the rounded BF16 values
+        if constexpr (std::is_same_v<rmsnorm_type, bfloat16_t>) {
+            vector_bfloat16_t output0, output1;
+            asc_float2bfloat16_rn(output0, sum0, mask_b32, ASC_POSITION_EVEN);
+            asc_storealign_pack(reinterpret_cast<__ubuf__ float*>(output_ptr), reinterpret_cast<vector_float&>(output0), mask_b32);
+            output_ptr += kNumChannelsPerVector / 2;
+            asc_float2bfloat16_rn(output1, sum1, mask_b32, ASC_POSITION_EVEN);
+            asc_storealign_pack(reinterpret_cast<__ubuf__ float*>(output_ptr), reinterpret_cast<vector_float&>(output1), mask_b32);
+            output_ptr += kNumChannelsPerVector / 2;
+            if constexpr (kRMSNorm) {
+                asc_bfloat162float(sum0, output0, mask_b16, ASC_POSITION_EVEN);
+                asc_bfloat162float(sum1, output1, mask_b16, ASC_POSITION_EVEN);
+            }
+        } else {
+            asc_storealign_postupdate(output_ptr, sum0, kNumChannelsPerVector / 2, mask_b32);
+            asc_storealign_postupdate(output_ptr, sum1, kNumChannelsPerVector / 2, mask_b32);
+        }
+
+        // Accumulate square sums in ascending 64-channel order
+        if constexpr (kRMSNorm) {
+            asc_mul(sum0, sum0, sum0, mask_b32);
+            asc_add(square_sum, square_sum, sum0, mask_b32);
+            asc_mul(sum1, sum1, sum1, mask_b32);
+            asc_add(square_sum, square_sum, sum1, mask_b32);
+        }
+    }
+    if constexpr (kRMSNorm)
+        asc_storealign(row_square_sum, square_sum, mask_b32);
+}
+
+// Normalize the combined output in FP32.
+template <uint32_t kHidden, typename rmsnorm_type>
+__simd_vf__ inline void vf_rms_norm(__ubuf__ rmsnorm_type* row, __ubuf__ rmsnorm_type* weight,
+                                    float rms_eps, __ubuf__ float* row_square_sum) {
+    constexpr uint32_t kNumChannelsPerVector = sizeof(vector_float) / sizeof(float);
+    const auto mask_b32 = asc_create_mask_b32(PAT_ALL);
+    vector_float inv_rms, value, weight_value, one;
+    asc_loadalign(inv_rms, row_square_sum);
+    asc_reduce_sum(inv_rms, inv_rms, mask_b32);
+    asc_duplicate(inv_rms, inv_rms, mask_b32);
+    asc_duplicate_scalar(one, 1.0f, mask_b32);
+    asc_mul_scalar(inv_rms, inv_rms, 1.0f / kHidden, mask_b32);
+    asc_add_scalar(inv_rms, inv_rms, rms_eps, mask_b32);
+    asc_sqrt(inv_rms, inv_rms, mask_b32);
+    asc_div(inv_rms, one, inv_rms, mask_b32);
+    for (uint32_t channel_idx = 0; channel_idx < kHidden; channel_idx += kNumChannelsPerVector) {
+        load_as_float(value, row + channel_idx);
+        load_as_float(weight_value, weight + channel_idx);
+        asc_mul(value, value, inv_rms, mask_b32);
+        asc_mul(value, value, weight_value, mask_b32);
+        if constexpr (std::is_same_v<rmsnorm_type, float>) {
+            asc_storealign(row + channel_idx, value, mask_b32);
+        } else {
+            vector_bfloat16_t packed;
+            asc_float2bfloat16_rn(packed, value, mask_b32, ASC_POSITION_EVEN);
+            asc_storealign_pack(reinterpret_cast<__ubuf__ float*>(row + channel_idx), reinterpret_cast<vector_float&>(packed), mask_b32);
+        }
     }
 }
 
