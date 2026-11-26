@@ -14,6 +14,7 @@ DeepGEMM Ascend 代码轻量，并且在多种矩阵形状上能达到硬件极�
 
 ## News
 
+- 2026.11.26: New release with latest features, optimizations, and fixes. Please see [#35](https://github.com/deepseek-ai/DeepGEMM-Ascend/pull/35) for more details.
 - 2026.09.30: Initial release of DeepGEMM Ascend, with support for Ascend 950 devices. The kernels are designed to achieve near-peak hardware performance.
 
 ## Quick Start
