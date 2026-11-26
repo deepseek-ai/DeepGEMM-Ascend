@@ -101,6 +101,12 @@ static std::optional<GemmDesc> get_gemm_desc(
         DJ_HOST_ASSERT(grouped_layout->is_contiguous());
         DJ_HOST_ASSERT(grouped_layout->scalar_type() == torch::kInt);
     }
+    // The epilogue accumulates in place into D, so C must be the same tensor: only the presence
+    // of `c` reaches the kernel, never a pointer into it.
+    if (c.has_value()) {
+        DJ_HOST_ASSERT(c->data_ptr() == d.data_ptr(),
+                       "c must be the same tensor as d; the kernel accumulates into d in place");
+    }
 
     // Meta and empty tensors have no data address; use storage identity for them.
     const bool is_cd_same = c.has_value() && ((d.is_meta() || d.numel() == 0) ? c->is_alias_of(d) : c->data_ptr() == d.data_ptr());
