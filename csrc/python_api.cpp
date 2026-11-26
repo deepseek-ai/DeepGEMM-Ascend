@@ -11,7 +11,10 @@
 #include "apis/einsum.hpp"
 #include "apis/layout.hpp"
 #include "apis/aclnn.hpp"
+#include "apis/mega_mhc.hpp"
 #include "apis/mega_moe.hpp"
+#include "apis/mega_gate.hpp"
+#include "apis/experimental.hpp"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -37,6 +40,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::einsum::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::aclnn_api::register_apis(m);
+    deep_gemm::mega_mhc::register_apis(m);
     deep_gemm::mega_moe::register_apis(m);
+    deep_gemm::mega_gate::register_apis(m);
     deep_jit::register_python_api(m, deep_gemm::jit);
+
+    // Register experimental kernels
+    deep_gemm::experimental::register_apis(m);
 }

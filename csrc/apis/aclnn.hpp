@@ -6,7 +6,9 @@
 #include <aclnn/acl_meta.h>
 #include <aclnnop/aclnn_quant_matmul_v5.h>
 #include <aclnnop/aclnn_matmul.h>
+#include <aclnnop/aclnn_batch_matmul.h>
 #include <aclnnop/aclnn_addmm.h>
+#include <aclnnop/aclnn_gemm_syrk.h>
 
 #include <deep_jit/backend/ascend/driver.hpp>
 #include <deep_jit/utils/exception.hpp>
@@ -259,6 +261,77 @@ inline constexpr auto aclnn_bf16_gemm_nn = aclnn_bf16_gemm<false, true>;
 inline constexpr auto aclnn_bf16_gemm_tn = aclnn_bf16_gemm<true, true>;
 inline constexpr auto aclnn_bf16_gemm_tt = aclnn_bf16_gemm<true, false>;
 
+// D = A @ A.mT for BF16 A and D, with either 2D or batched 3D tensors.
+static void batched_syrk(const torch::Tensor& a, const torch::Tensor& d) {
+    DJ_HOST_ASSERT(a.dim() == 2 or a.dim() == 3);
+    DJ_HOST_ASSERT(d.dim() == a.dim());
+    DJ_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DJ_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    const auto a_3d = a.dim() == 2 ? a.unsqueeze(0) : a;
+    const auto d_3d = d.dim() == 2 ? d.unsqueeze(0) : d;
+    const auto [num_batches, m, k] = get_shape_by_spec<"bmk">("bmk"_sp = a_3d, "bmm"_sp = d_3d);
+    DJ_HOST_ASSERT(a_3d.stride(-1) == 1, "batched_syrk requires a contiguous K dimension");
+    if (num_batches == 0 or gemm_early_return(m, m, k, d_3d, std::nullopt))
+        return;
+
+    auto make_nd_tensor = [](const torch::Tensor& tensor) {
+        const int64_t storage_size = tensor.storage().nbytes() / tensor.element_size();
+        return AclTensor(aclCreateTensor(
+            tensor.sizes().data(), tensor.dim(), ACL_BF16, tensor.strides().data(), tensor.storage_offset(),
+            ACL_FORMAT_ND, &storage_size, 1, tensor.storage().mutable_data()
+        ));
+    };
+    auto t_a = make_nd_tensor(a_3d);
+    auto t_d = make_nd_tensor(d_3d);
+    AclScalar<float> zero(0.f);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    DJ_ACL_CHECK(aclnnGemmSyrkGetWorkspaceSize(
+        t_a, t_d, nullptr, zero, false, "full", &ws_size, &executor
+    ));
+
+    void* ws_ptr = nullptr;
+    torch::Tensor ws_tensor;
+    if (ws_size > 0) {
+        ws_tensor = torch::empty({static_cast<int64_t>(ws_size)}, torch::TensorOptions().dtype(torch::kUInt8).device(a.device()));
+        ws_ptr = ws_tensor.data_ptr();
+    }
+    // TODO: The current ACLNN epilogue reads D even with beta=0, so D must be explicitly zeroed
+    // to avoid incorrect results from expressions such as 0 * NaN.
+    d.zero_();
+    DJ_ACL_CHECK(aclnnGemmSyrk(ws_ptr, ws_size, executor, get_current_npu_stream()));
+}
+
+static void batched_symm(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d) {
+    for (const auto& tensor : {a, b, d})
+        DJ_HOST_ASSERT(tensor.dim() == 2 or tensor.dim() == 3);
+    DJ_HOST_ASSERT(a.scalar_type() == b.scalar_type() and a.scalar_type() == d.scalar_type());
+    DJ_HOST_ASSERT(a.stride(-1) == 1 or a.stride(-2) == 1);
+    DJ_HOST_ASSERT(b.stride(-1) == 1 or b.stride(-2) == 1);
+    check_major_type_cd(d);
+
+    const auto a_3d = a.dim() == 2 ? a.unsqueeze(0) : a;
+    const auto b_3d = b.dim() == 2 ? b.unsqueeze(0) : b;
+    const auto d_3d = d.dim() == 2 ? d.unsqueeze(0) : d;
+    const auto [num_batches, m, n] = get_shape_by_spec<"bmn">("bmm"_sp = a_3d, "bmn"_sp = b_3d, "bmn"_sp = d_3d);
+    if (num_batches == 0 or gemm_early_return(m, n, m, d_3d, std::nullopt))
+        return;
+
+    AclTensor t_a(a_3d), t_b(b_3d), t_d(d_3d);
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    DJ_ACL_CHECK(aclnnBatchMatMulGetWorkspaceSize(t_a, t_b, t_d, 0, &ws_size, &executor));
+
+    void* ws_ptr = nullptr;
+    torch::Tensor ws_tensor;
+    if (ws_size > 0) {
+        ws_tensor = torch::empty({static_cast<int64_t>(ws_size)}, torch::TensorOptions().dtype(torch::kUInt8).device(a.device()));
+        ws_ptr = ws_tensor.data_ptr();
+    }
+    DJ_ACL_CHECK(aclnnBatchMatMul(ws_ptr, ws_size, executor, get_current_npu_stream()));
+}
+
 static void register_apis(pybind11::module_& m) {
 
     m.def("aclnn_fp8_fp4_gemm_nt", aclnn_fp8_fp4_gemm_nt,
@@ -286,6 +359,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("aclnn_bf16_gemm_nn", aclnn_bf16_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
     m.def("aclnn_bf16_gemm_tn", aclnn_bf16_gemm_tn, py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
     m.def("aclnn_bf16_gemm_tt", aclnn_bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("batched_syrk", batched_syrk, py::arg("a"), py::arg("d"));
+    m.def("batched_symm", batched_symm, py::arg("a"), py::arg("b"), py::arg("d"));
 
     // Upstream cuBLASLt API aliases backed by ACLNN.
     m.attr("cublaslt_gemm_nt") = m.attr("aclnn_bf16_gemm_nt");

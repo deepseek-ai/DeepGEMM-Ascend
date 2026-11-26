@@ -9,7 +9,7 @@ import time
 import torch
 
 import deep_gemm
-from deep_gemm.testing.bench import bench_msprof, close_persistent_profiler
+from deep_gemm.testing.bench import bench_msprof, close_persistent_profiler, flush_l2_cache
 from deep_gemm.testing.par_compile import par_compile, dry_run
 from utils import calc_diff, count_bytes, empty_kv_cache
 
@@ -559,12 +559,11 @@ def run_paged_sparse_mqa_logits_perf_case(kv_len, skip_prof):
         print(f' > K={kv_len}, {name}: {prof.dur_us:.1f} us | {format_pipe_profile(prof)}', flush=True)
     close_persistent_profiler()
 
-    flush_buffer = torch.empty(8 * 1024 ** 3 // 4, dtype=torch.int32, device='npu')
     start, end = (torch.npu.Event(enable_timing=True) for _ in range(2))
     # Flush once before each prepare + FIRST + 3 REUSE chain.
     chain_us = []
     for iteration in range(40):
-        flush_buffer.zero_()
+        flush_l2_cache()
         start.record()
         chain_metadata = make_metadata()
         for _ in range(num_layers):

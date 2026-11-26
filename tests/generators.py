@@ -267,6 +267,7 @@ class GemmTestDesc:
     ks_cpu: list[int] | None = None
     host_ks_cpu: list[int] | None = None
     profile: bool = True
+    same_ab: bool = False
 
     @property
     def m(self): return self.shape_mnk[0]
@@ -310,7 +311,7 @@ class GemmTestDesc:
         a, a_repr = generate_operand_with_major(
             (m, k), self.a_recipe, self.a_dtype,
             major_dim=0 if self.a_major == Major.MN else 1, device=device)
-        b, b_repr = generate_operand_with_major(
+        b, b_repr = (a, a_repr) if self.same_ab else generate_operand_with_major(
             (n, k), self.b_recipe, self.b_dtype,
             major_dim=0 if self.b_major == Major.MN else 1, device=device)
 
@@ -412,12 +413,14 @@ class GemmTestDesc:
         a, a_repr = generate_operand_with_major(
             (self.num_groups, m, k), (1, *self.a_recipe), self.a_dtype,
             major_dim=1 if self.a_major == Major.MN else 2, device=device)
-        b, b_repr = generate_operand_with_major(
+        b, b_repr = (a, a_repr) if self.same_ab else generate_operand_with_major(
             (self.num_groups, n, k), (1, *self.b_recipe), self.b_dtype,
             major_dim=1 if self.b_major == Major.MN else 2, device=device)
 
         d = torch.empty(self.num_groups, m, n, dtype=self.cd_dtype, device=device)
         if device != 'meta':
+            if self.same_ab:
+                a_repr = b_repr = a_repr.float()
             for i in range(self.num_groups):
                 if self.accumulate:
                     d[i] = a_repr[i] @ b_repr[i].T + c[i]
@@ -526,9 +529,7 @@ def _enumerate_normal_unaligned_k(a_dtype: torch.dtype, b_dtype: torch.dtype):
     ]
     for shape, a_major, b_major in product(shapes, [Major.K, Major.MN], [Major.K, Major.MN]):
         m, n, k = shape
-        # fp4 packs two int4 values per byte along K and the kernel requires shape_k % 2 == 0,
-        # so an fp4 operand needs an even K.  Round odd K down to the nearest even value (keeps
-        # it unaligned to BLOCK_K / 64 while being packable).
+        # FP4 packs two values per byte; double odd K to make it packable while keeping a K tail.
         if (a_dtype == torch.float4_e2m1fn_x2 or b_dtype == torch.float4_e2m1fn_x2) and k % 2 != 0:
             k *= 2
         yield GemmTestDesc(
@@ -594,7 +595,7 @@ def _enumerate_m_grouped_contiguous(
 
     yield create_test(128, 1, 4, 4, Major.K)  # minimal case
 
-    m_group_list = [(4, 1), (4, 8192), (8, 4096)]
+    m_group_list = [(4, 1), (4, 8192), (8, 4096), (16, 2048)]
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
 
     for num_groups, expected_m in m_group_list:
@@ -677,6 +678,28 @@ def enumerate_gemm_tests(
     else:
         raise ValueError(f'Unsupported gemm type: {gemm_type}')
     return gen
+
+
+def enumerate_syrk_tests(batched: bool = True, strided: bool = False):
+    shapes = [
+        (16, 4608, 5120), (16, 1536, 5120), (16, 576, 5120),
+        (8, 1536, 24576), (8, 512, 32768), (4, 5120, 16384),
+        (8, 4096, 7168), (8, 2048, 7168),
+    ]
+    boundaries = [(1, 1, 1), (2, 63, 31), (1, 64, 64), (2, 65, 33),
+                  (0, 32, 64), (2, 0, 64), (2, 32, 0)]
+    for major, cases in ((Major.K, shapes + boundaries), (Major.MN, [(2, 4, 8), (2, 8, 8)])):
+        for num_batches, m, k in cases:
+            if num_batches == 0 and (not batched or strided):
+                continue
+            yield GemmTestDesc(
+                GemmType.Batched if batched else GemmType.Normal,
+                torch.bfloat16, torch.bfloat16, torch.bfloat16,
+                (m, m, k), major, major,
+                num_groups=num_batches if batched else None,
+                strided=strided, same_ab=True,
+                profile=batched and not strided and (num_batches, m, k) in shapes,
+            )
 
 
 def enumerate_sf_layout():

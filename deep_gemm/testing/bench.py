@@ -22,6 +22,7 @@ __all__ = [
     'KernelProfile',
     'bench_msprof',
     'close_persistent_profiler',
+    'flush_l2_cache',
 ]
 
 @dataclass
@@ -260,12 +261,19 @@ def suppress_stdout_stderr(suppress: bool):
             os.close(saved_stderr)
 
 
-def _make_l2_flush_buffer():
+_ascendcl = None
+
+
+def flush_l2_cache():
+    """Synchronize the current NPU device and flush its L2 cache."""
+    global _ascendcl
     import torch
 
-    properties = torch.npu.get_device_properties(torch.npu.current_device())
-    num_bytes = 2 * properties.L2_cache_size
-    return torch.empty(num_bytes // 4, dtype=torch.int, device='npu')
+    if _ascendcl is None:
+        _ascendcl = AscendCL()
+    # aclrtDeviceL2CacheFlush is host-synchronous and does not wait for queued stream work.
+    torch.npu.synchronize()
+    _ascendcl.flush_l2_cache(None)
 
 
 def _select_profiles(profiles, kernel_names, return_all_kernels):
@@ -303,9 +311,9 @@ def bench_msprof(
         barrier: Optional callable to synchronize across ranks (e.g. dist.barrier).
         return_all_kernels: If True, return dict[str, KernelProfile] of every kernel
                       captured in the profiled window. Note this includes the helper
-                      kernels launched inside the window (L2 flush, npu_sleep, the
-                      all_reduce used for barrier profiling), so use kernel_names to
-                      pick the kernel(s) of interest for a clean measurement.
+                      kernels launched inside the window (npu_sleep, the all_reduce
+                      used for barrier profiling), so use kernel_names to pick the
+                      kernel(s) of interest for a clean measurement.
         suppress_verbose_output: If True, suppress torch_npu.profiler output.
         backend: ``slow`` parses exported CSV, ``fast`` parses one-shot raw data,
                  and ``persistent`` reuses one process-resident raw PMU session.
@@ -331,7 +339,6 @@ def bench_msprof(
         fn()
     torch.npu.synchronize()
 
-    flush_buffer = _make_l2_flush_buffer() if flush_l2 else None
     profile_barrier = barrier if barrier_comm_profiling else None
     if barrier_comm_profiling and profile_barrier is None:
         import torch.distributed as dist
@@ -341,8 +348,8 @@ def bench_msprof(
 
     def profile_fn():
         for _ in range(num_tests):
-            if flush_buffer is not None:
-                flush_buffer.zero_()
+            if flush_l2:
+                flush_l2_cache()
             if profile_barrier is not None:
                 # 20ms, keep the device busy so the barrier dominates instead
                 # of kernel launch gaps.
@@ -574,6 +581,13 @@ class api:
 
         setattr(instance, self.name, function)
         return function
+
+
+class AscendCL:
+    def __init__(self, lib='libascendcl.so'):
+        self.library = ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+    @api('aclrtDeviceL2CacheFlush', check_ret=0)
+    def flush_l2_cache(self, rsv: ctypes.c_void_p) -> ctypes.c_int: ...
 
 
 class MsProfiler:

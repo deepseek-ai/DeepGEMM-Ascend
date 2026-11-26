@@ -1,1 +1,1 @@
-from .hc_prenorm import tf32_hc_prenorm_gemm
+from .hc_prenorm import tf32_hc_prenorm_gemm as tf32_hc_prenorm_gemm

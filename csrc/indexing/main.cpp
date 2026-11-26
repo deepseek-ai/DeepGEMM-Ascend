@@ -7,6 +7,7 @@
 #include <deep_gemm/fp8_gemm.hpp>
 #include <deep_gemm/mqa_logits.hpp>
 #include <deep_gemm/mega_moe.hpp>
+#include <deep_gemm/mega_gate.hpp>
 #include <deep_gemm/sleep.hpp>
 
 int main() {

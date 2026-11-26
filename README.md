@@ -14,6 +14,7 @@ DeepGEMM Ascend 代码轻量，并且在多种矩阵形状上能达到硬件极�
 
 ## News
 
+- 2026.11.26: New release with latest features, optimizations, and fixes. Please see [#35](https://github.com/deepseek-ai/DeepGEMM-Ascend/pull/35) for more details.
 - 2026.09.30: Initial release of DeepGEMM Ascend, with support for Ascend 950 devices. The kernels are designed to achieve near-peak hardware performance.
 
 ## Quick Start
@@ -21,7 +22,7 @@ DeepGEMM Ascend 代码轻量，并且在多种矩阵形状上能达到硬件极�
 ### Requirements
 
 - HUAWEI Ascend NPU (developed and validated on the Ascend 950 series)
-- CANN 9.20 toolkit providing `bin/bisheng`, `bin/ld.lld`
+- CANN 9.3.0 toolkit providing `bin/bisheng`, `bin/ld.lld`, with `aclnnGemmSyrk` headers and library installed
 - Torch NPU package `torch_npu`
 - Python 3.10 or higher
 - Compilers and standard libraries with C++20 `<format>` support
@@ -77,6 +78,7 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.transform_k_grouped_sf_into_required_layout`: transform K-grouped scaling factors into the required layout
 - `deep_gemm.get_paged_mqa_logits_metadata`: build the scheduling metadata for the paged MQA kernels
 - `deep_gemm.aclnn_fp8_fp4_gemm_{nt, nn, tn, tt}` and `deep_gemm.aclnn_bf16_gemm_{nt, nn, tn, tt}`: ACLNN reference GEMMs used to cross-check the kernels in tests
+- `deep_gemm.batched_syrk` and `deep_gemm.batched_symm`: ACLNN wrappers computing `D = A @ A.mT` and `D = A @ B` (symmetric `A`), respectively; support 2D and batched 3D tensors.
 
 ### Environment Variables
 

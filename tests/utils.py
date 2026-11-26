@@ -67,6 +67,21 @@ def assert_direct_output_matches_fp32_accumulation(output: torch.Tensor, launch,
     assert torch.equal(output.view(bits_dtype), expected.view(bits_dtype)), label
 
 
+def _quartet_hash(values: np.ndarray, with_second_pair: bool = False):
+    h = (values[..., 0] * np.uint32(0x5671d42b) + values[..., 1] * np.uint32(0x9995e499) +
+         values[..., 2] * np.uint32(0xace1b8a5) + values[..., 3] * np.uint32(0xe153538d) +
+         np.arange(values.shape[-2], dtype=np.uint32))
+    h = (h ^ (h >> 23)) * np.uint32(0x7feb352d)
+    h ^= h >> 16
+    h1 = h * np.uint32(0x846ca68b)
+    h1 ^= h1 >> 11
+    if not with_second_pair:
+        return h1
+    h2 = h * np.uint32(0xd35a2d97)
+    h2 ^= h2 >> 11
+    return h1, h2
+
+
 def assert_stochastic_bf16_matches_fp32(output: torch.Tensor, launch, label: str) -> None:
     assert output.dtype == torch.bfloat16
     fp32 = torch.empty_strided(output.shape, output.stride(), device=output.device, dtype=torch.float32)
@@ -76,20 +91,55 @@ def assert_stochastic_bf16_matches_fp32(output: torch.Tensor, launch, label: str
     n = values.shape[-1]
     values = np.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, -n % 4)])
     values = values.reshape(*values.shape[:-1], -1, 4)
-    h = (values[..., 0] * np.uint32(0x5671d42b) + values[..., 1] * np.uint32(0x9995e499) +
-         values[..., 2] * np.uint32(0xace1b8a5) + values[..., 3] * np.uint32(0xe153538d) +
-         np.arange(values.shape[-2], dtype=np.uint32))
-    h = (h ^ (h >> 23)) * np.uint32(0x7feb352d)
-    h ^= h >> 16
-    h1, h2 = h * np.uint32(0x846ca68b), h * np.uint32(0xd35a2d97)
-    h1 ^= h1 >> 11
-    h2 ^= h2 >> 11
+    h1, h2 = _quartet_hash(values, with_second_pair=True)
     random_bits = np.stack((h1 & 0xffff, h1 >> 16, h2 & 0xffff, h2 >> 16), axis=-1)
     # Compare the discarded tail with the complementary random threshold.
     rounded = (values >> 16) + ((values & 0xffff) > (0xffff - random_bits))
     rounded = np.where((values & 0x7fffffff) > 0x7f800000, 0x7fc0, rounded).astype(np.uint16)
     expected = torch.from_numpy(rounded.reshape(*fp32.shape[:-1], -1)[..., :n].copy()).view(torch.bfloat16)
     assert torch.equal(output.cpu().view(torch.int16), expected.view(torch.int16)), label
+
+
+def assert_stochastic_fp8_matches_fp32(output: torch.Tensor, sfd: torch.Tensor, launch, label: str) -> None:
+    assert output.dtype == torch.float8_e4m3fn
+    shape, n = output.shape, output.size(-1)
+    assert n % 128 == 0
+    num_batches = int(sfd.size(1)) * 64 // n
+    num_rows = output.numel() // n
+    num_group_rows = num_rows // num_batches
+
+    fp32 = torch.empty_strided(output.shape, output.stride(), device=output.device, dtype=torch.float32)
+    launch(fp32)
+
+    # Per-row groups of 32 columns: |amax| -> UE8M0 exponent -> scaled FP32
+    groups = fp32.contiguous().reshape(num_rows, n // 32, 32)
+    amax_bits = groups.abs().amax(dim=-1).cpu().numpy().view(np.uint32)
+    sf_exp = np.maximum((amax_bits + np.uint32(0x1fffff)) >> 23, np.uint32(113)) - np.uint32(8)
+    sf_inv = torch.from_numpy(((np.uint32(254) - sf_exp) << 23).view(np.float32)).to(groups.device)
+    bits = (groups * sf_inv.unsqueeze(-1)).cpu().numpy().view(np.uint32).reshape(num_rows, n // 4, 4)
+
+    # Quartet hash and 16-bit thresholds (L, rev16(L), H, rev16(H))
+    h = _quartet_hash(bits)
+    pairs = np.stack((h & 0xffff, h >> 16), axis=-1).astype(np.uint16)
+    rev = ((pairs & 0x5555) << 1) | ((pairs >> 1) & 0x5555)
+    rev = ((rev & 0x3333) << 2) | ((rev >> 2) & 0x3333)
+    rev = ((rev & 0x0f0f) << 4) | ((rev >> 4) & 0x0f0f)
+    rev = ((rev & 0x00ff) << 8) | ((rev >> 8) & 0x00ff)
+    random_bits = np.stack((pairs[..., 0], rev[..., 0], pairs[..., 1], rev[..., 1]), axis=-1).astype(np.uint32)
+
+    # Align normal/subnormal mantissas, add the 16-bit threshold and saturate at 0x7e
+    exp32 = (bits >> 23) & 0xff
+    shift = np.minimum(121 - np.minimum(exp32, 121), 25)
+    mant = np.where(exp32 > 120, ((exp32 - 120) << 23) | (bits & 0x7fffff),
+                    ((bits & 0x7fffff) | 0x800000) >> shift)
+    codes = np.minimum((mant >> 20) + ((((mant >> 4) & 0xffff) + random_bits) >> 16), 0x7e)
+    expected = torch.from_numpy((((bits >> 31) << 7) | codes).astype(np.uint8)).reshape(shape)
+    assert torch.equal(output.cpu().view(torch.uint8), expected), label
+
+    expected_sf = sf_exp.reshape(num_batches, num_group_rows, n // 32).transpose(1, 0, 2)
+    expected_sf = torch.from_numpy(expected_sf.reshape(num_group_rows, -1).astype(np.uint8))
+    actual_sf = sfd.contiguous().cpu().view(torch.uint8)
+    assert torch.equal(actual_sf, expected_sf), f'{label} (SFs)'
 
 
 def count_bytes(*tensors) -> int:
